@@ -42,6 +42,65 @@ class ExecutorSettings(ExecutorSettingsBase):
             "required": True,
         },
     )
+    fsap_id: Optional[str] = (
+        field(
+            default=None,
+            metadata={
+                "help": (
+                    "The fsap id of the EFS instance you want to use that "
+                    "is shared with your local environment"
+                ),
+                "env_var": False,
+                "required": False,
+            },
+        ),
+    )
+    efs_project_path: Optional[str] = (
+        field(
+            default=None,
+            metadata={
+                "help": "The EFS path that contains the project Snakemake is running",
+                "env_var": False,
+                "required": False,
+            },
+        ),
+    )
+    task_queue: Optional[str] = field(
+        default=None,
+        metadata={
+            "help": "The AWS Batch task queue ARN used for running tasks",
+            "env_var": False,
+            "required": True,
+        },
+    )
+    workflow_role: Optional[str] = field(
+        default=None,
+        metadata={
+            "help": "The AWS role that is used for running the tasks",
+            "env_var": False,
+            "required": True,
+        },
+    )
+    tags: List[str] = field(
+        default=[],
+        metadata={
+            "help": (
+                "The tags that should be applied to all of the batch tasks,"
+                "of the form KEY=VALUE"
+            ),
+            "env_var": False,
+            "required": False,
+        },
+    )
+    task_timeout: Optional[int] = field(
+        default=None,
+        metadata={
+            "help": (
+                "Task timeout (seconds) will force AWS Batch to terminate "
+                "a Batch task if it fails to finish within the timeout, minimum 60"
+            )
+        },
+    )
 
 
 # Required:
