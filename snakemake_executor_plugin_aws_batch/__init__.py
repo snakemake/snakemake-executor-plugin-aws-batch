@@ -75,7 +75,7 @@ class ExecutorSettings(ExecutorSettingsBase):
         },
     )
     tags: Optional[List[str]] = field(
-        default=[],
+        default=None,
         metadata={
             "help": (
                 "The tags that should be applied to all of the batch tasks,"
