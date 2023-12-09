@@ -106,6 +106,7 @@ common_settings = CommonSettings(
     # are expected to specify False here.
     non_local_exec=True,
     implies_no_shared_fs=True,
+    job_deploy_sources=True,
     # whether arguments for setting the storage provider shall be passed to jobs
     pass_default_storage_provider_args=True,
     # whether arguments for setting default resources shall be passed to jobs
