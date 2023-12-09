@@ -1,0 +1,25 @@
+[tool.poetry]
+name = "snakemake-executor-plugin-aws-batch"
+version = "0.1.0"
+description = ""
+authors = ["jakevc <jake.vancampen7@gmail.com>"]
+readme = "README.md"
+repository = "https://github.com/snakemake/snakemake-executor-plugin-aws-batch"
+documentation = "https://snakemake.github.io/snakemake-plugin-catalog/plugins/executor/aws-batch.html" 
+keywords = ["snakemake", "plugin", "executor", "aws-batch"]
+
+[tool.poetry.dependencies]
+python = "^3.11"
+snakemake-interface-common = "^1.15.0"
+snakemake-interface-executor-plugins = "^8.1.1"
+
+[tool.poetry.group.dev.dependencies]
+black = "^23.11.0"
+flake8 = "^6.1.0"
+coverage = "^7.3.2"
+pytest = "^7.4.3"
+snakemake = "^7.32.4"
+
+[build-system]
+requires = ["poetry-core"]
+build-backend = "poetry.core.masonry.api"
