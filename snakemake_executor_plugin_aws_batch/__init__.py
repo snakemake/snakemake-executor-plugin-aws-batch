@@ -1,4 +1,7 @@
 from dataclasses import dataclass, field
+from pprint import pformat
+import boto3
+import botocore
 from typing import List, Generator, Optional
 from snakemake_interface_executor_plugins.executors.base import SubmittedJobInfo
 from snakemake_interface_executor_plugins.executors.remote import RemoteExecutor
@@ -9,7 +12,7 @@ from snakemake_interface_executor_plugins.settings import (
 from snakemake_interface_executor_plugins.jobs import (
     ExecutorJobInterface,
 )
-from snakemake_interface_common.exceptions import WorkflowError  # noqa
+from snakemake_interface_common.exceptions import WorkflowError
 
 
 # Optional:
@@ -20,10 +23,10 @@ from snakemake_interface_common.exceptions import WorkflowError  # noqa
 # of None or anything else that makes sense in your case.
 @dataclass
 class ExecutorSettings(ExecutorSettingsBase):
-    myparam: Optional[int] = field(
+    region: Optional[int] = field(
         default=None,
         metadata={
-            "help": "Some help text",
+            "help": "AWS Region",
             # Optionally request that setting is also available for specification
             # via an environment variable. The variable will be named automatically as
             # SNAKEMAKE_<executor-name>_<param-name>, all upper case.
@@ -133,26 +136,24 @@ common_settings = CommonSettings(
 # Implementation of your executor
 class Executor(RemoteExecutor):
     def __post_init__(self):
-        # access workflow
-        self.workflow
+        # set snakemake container image
+        self.container_image = self.workflow.remote_execution_settings.container_image
+
         # access executor specific settings
-        self.workflow.executor_settings
+        self.settings: ExecutorSettings = self.workflow.executor_settings
+        self.logger.debug(f"ExecutorSettings: {pformat(self.settings, indent=2)}")
 
-        # IMPORTANT: in your plugin, only access methods and properties of
-        # Snakemake objects (like Workflow, Persistence, etc.) that are
-        # defined in the interfaces found in the
-        # snakemake-interface-executor-plugins and the
-        # snakemake-interface-common package.
-        # Other parts of those objects are NOT guaranteed to remain
-        # stable across new releases.
-
-        # To ensure that the used interfaces are not changing, you should
-        # depend on these packages as >=a.b.c,<d with d=a+1 (i.e. pin the
-        # dependency on this package to be at least the version at time
-        # of development and less than the next major version which would
-        # introduce breaking changes).
-
-        # In case of errors outside of jobs, please raise a WorkflowError
+        # init batch client
+        try:
+            self.aws = boto3.Session().client(  # Session() needed for thread safety
+                "batch",
+                region_name=self.settings.region,
+                config=botocore.config.Config(
+                    retries={"max_attempts": 5, "mode": "standard"}
+                ),
+            )
+        except botocore.exceptions.ClientError as exn:
+            raise WorkflowError(exn)
 
     def run_job(self, job: ExecutorJobInterface):
         # Implement here how to run a job.
@@ -196,4 +197,11 @@ class Executor(RemoteExecutor):
     def cancel_jobs(self, active_jobs: List[SubmittedJobInfo]):
         # Cancel all active jobs.
         # This method is called when Snakemake is interrupted.
-        ...
+        # perform additional steps on shutdown if necessary
+        # deregister everything from AWS so the environment is clean
+        self.logger.info("shutting down")
+        if not self.terminated_jobs:
+            self.terminate_active_jobs()
+
+        for job_def in self.created_job_defs:
+            self.deregister(job_def)
