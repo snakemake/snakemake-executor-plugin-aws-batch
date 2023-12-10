@@ -4,6 +4,7 @@ import boto3
 import uuid
 import heapq
 import botocore
+import shlex
 import time
 import threading
 from typing import List, Generator, Optional
@@ -27,6 +28,16 @@ from snakemake_interface_common.exceptions import WorkflowError
 # of None or anything else that makes sense in your case.
 @dataclass
 class ExecutorSettings(ExecutorSettingsBase):
+    access_key_id: Optional[int] = field(
+        default=None,
+        metadata={"help": "AWS access key id", "env_var": True, "required": False},
+        repr=False,
+    )
+    access_key: Optional[int] = field(
+        default=None,
+        metadata={"help": "AWS access key", "env_var": True, "required": False},
+        repr=False,
+    )
     region: Optional[int] = field(
         default=None,
         metadata={
@@ -58,23 +69,23 @@ class ExecutorSettings(ExecutorSettingsBase):
             },
         ),
     )
-    task_queue: Optional[str] = field(
+    job_queue: Optional[str] = field(
         default=None,
         metadata={
             "help": "The AWS Batch task queue ARN used for running tasks",
-            "env_var": False,
+            "env_var": True,
             "required": True,
         },
     )
-    workflow_role: Optional[str] = field(
+    execution_role: Optional[str] = field(
         default=None,
         metadata={
-            "help": "The AWS role that is used for running the tasks",
-            "env_var": False,
+            "help": "The AWS execution role ARN that is used for running the tasks",
+            "env_var": True,
             "required": True,
         },
     )
-    tags: Optional[List[str]] = field(
+    tags: Optional[dict] = field(
         default=None,
         metadata={
             "help": (
@@ -105,7 +116,9 @@ common_settings = CommonSettings(
     # plugins (snakemake-executor-plugin-dryrun, snakemake-executor-plugin-local)
     # are expected to specify False here.
     non_local_exec=True,
+    # whether the executor implies to not have a shared file system
     implies_no_shared_fs=True,
+    # whether to deploy workflow sources to default storage provider before execution
     job_deploy_sources=True,
     # whether arguments for setting the storage provider shall be passed to jobs
     pass_default_storage_provider_args=True,
@@ -136,15 +149,21 @@ class Executor(RemoteExecutor):
 
         # keep track of job definitions
         self.created_job_defs = list()
+        self.mount_path = None
+        self._describer = BatchJobDescriber()
 
         # init batch client
         try:
-            self.aws = boto3.Session().client(  # Session() needed for thread safety
-                "batch",
-                region_name=self.settings.region,
-                config=botocore.config.Config(
-                    retries={"max_attempts": 5, "mode": "standard"}
-                ),
+            self.batch_client = (
+                boto3.Session().client(  # Session() needed for thread safety
+                    "batch",
+                    aws_access_key_id=self.settings.access_key_id,
+                    aws_secret_access_key=self.settings.access_key,
+                    region_name=self.settings.region,
+                    config=botocore.config.Config(
+                        retries={"max_attempts": 5, "mode": "standard"}
+                    ),
+                )
             )
         except Exception as e:
             raise WorkflowError(e)
@@ -194,19 +213,25 @@ class Executor(RemoteExecutor):
         job_definition_type = "container"
 
         # get job resources or default
-        vcpu = job.resources.get("_cores", str(1))
-        mem = job.resources.get("mem_mb", str(1024))
+        vcpu = str(job.resources.get("_cores", str(1)))
+        mem = str(job.resources.get("mem_mb", str(2048)))
 
         # job definition container properties
         container_properties = {
-            "executionRoleArn": self.settings.workflow_role,
             "command": ["snakemake"],
             "image": self.container_image,
-            "privileged": True,
+            # fargate required privileged False
+            "privileged": False,
             "resourceRequirements": [
-                {"type": "VCPU", "value": "1"},
-                {"type": "MEMORY", "value": "1024"},
+                # resource requirements have to be compatible
+                # see: https://docs.aws.amazon.com/batch/latest/APIReference/API_ResourceRequirement.html # noqa
+                {"type": "VCPU", "value": vcpu},
+                {"type": "MEMORY", "value": mem},
             ],
+            "networkConfiguration": {
+                "assignPublicIp": "ENABLED",
+            },
+            "executionRoleArn": self.settings.execution_role,
         }
 
         # TODO: or not todo ?
@@ -216,14 +241,16 @@ class Executor(RemoteExecutor):
         # ) = self._prepare_mounts()
 
         # register the job definition
+        tags = self.settings.tags if isinstance(self.settings.tags, dict) else dict()
         try:
-            job_def = self.aws.register_job_definition(
+            job_def = self.batch_client.register_job_definition(
                 jobDefinitionName=job_definition_name,
                 type=job_definition_type,
                 containerProperties=container_properties,
-                tags=self.settings.tags,
+                platformCapabilities=["FARGATE"],
+                tags=tags,
             )
-            self.created_job_defs.append(self.job_def)
+            self.created_job_defs.append(job_def)
         except Exception as e:
             raise WorkflowError(e)
 
@@ -232,7 +259,7 @@ class Executor(RemoteExecutor):
         # configure job parameters
         job_params = {
             "jobName": job_name,
-            "jobQueue": self.settings.task_queue,
+            "jobQueue": self.settings.job_queue,
             "jobDefinition": "{}:{}".format(
                 job_def["jobDefinitionName"], job_def["revision"]
             ),
@@ -243,18 +270,22 @@ class Executor(RemoteExecutor):
                     {"type": "MEMORY", "value": mem},
                 ],
             },
-            "tags": self.settings.tags,
         }
 
+        if self.settings.tags:
+            job_params["tags"] = self.settings.tags
+
         if self.settings.task_timeout is not None:
-            job_params["timeout"] = {"attemptDurationSeconds": self.task_timeout}
+            job_params["timeout"] = {
+                "attemptDurationSeconds": self.settings.task_timeout
+            }
 
         # submit the job
         try:
-            submitted = self.aws.submit_job(**job_params)
+            submitted = self.batch_client.submit_job(**job_params)
             self.logger.debug(
                 "AWS Batch job submitted with queue {}, jobId {} and tags {}".format(
-                    self.task_queue, job["jobId"], self.tags
+                    self.settings.job_queue, submitted["jobId"], self.settings.tags
                 )
             )
         except Exception as e:
@@ -274,13 +305,7 @@ class Executor(RemoteExecutor):
     def _generate_snakemake_command(self, job: JobExecutorInterface) -> str:
         """generates the snakemake command for the job"""
         exec_job = self.format_job_exec(job)
-        command = list(filter(None, exec_job.replace('"', "").split(" ")))
-        return_command = ["sh", "-c"]
-        snakemake_run_command = "cd {}/{} && {}".format(
-            self.mount_path, self.efs_project_path, " ".join(command)
-        )
-        return_command.append(snakemake_run_command)
-        return return_command
+        return ["sh", "-c", shlex.quote(exec_job)]
 
     async def check_active_jobs(
         self, active_jobs: List[SubmittedJobInfo]
@@ -333,7 +358,7 @@ class Executor(RemoteExecutor):
         ]
         exit_code = None
         log_stream_name = None
-        job_desc = self._describer.describe(self.aws, job.external_jobid, 1)
+        job_desc = self._describer.describe(self.batch_client, job.external_jobid, 1)
         job_status = job_desc["status"]
 
         # set log stream name if not none
@@ -392,7 +417,7 @@ class Executor(RemoteExecutor):
         """terminate job from submitted job info"""
         try:
             self.logger.debug(f"terminating job {job.external_jobid}")
-            self.aws.terminate_job(
+            self.batch_client.terminate_job(
                 jobId=job.external_jobid,
                 reason="terminated by snakemake",
             )
@@ -407,7 +432,7 @@ class Executor(RemoteExecutor):
         try:
             job_def_arn = job.aux["jobDefArn"]
             self.logger.debug(f"de-registering Batch job definition {job_def_arn}")
-            self.aws.deregister_job_definition(jobDefinition=job_def_arn)
+            self.batch_client.deregister_job_definition(jobDefinition=job_def_arn)
         except Exception as e:
             # AWS expires job definitions after 6mo
             # so failing to delete them isn't fatal

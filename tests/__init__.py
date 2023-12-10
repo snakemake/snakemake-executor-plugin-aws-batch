@@ -14,8 +14,11 @@ class TestWorkflowsBase(snakemake.common.tests.TestWorkflowsMinioPlayStorageBase
     def get_executor_settings(self) -> Optional[ExecutorSettingsBase]:
         # instantiate ExecutorSettings of this plugin as appropriate
         return ExecutorSettings(
-            account_url=os.getenv("SNAKEMAKE_AWS_"),
-            account_key=os.getenv("SNAKEMAKE_AWS_"),
+            access_key_id=os.getenv("SNAKEMAKE_AWS_BATCH_ACCESS_KEY_ID"),
+            access_key=os.getenv("SNAKEMAKE_AWS_BATCH_ACCESS_KEY"),
+            region=os.environ.get("SNAKEMAKE_AWS_BATCH_REGION", "us-east-1"),
+            job_queue=os.environ.get("SNAKEMAKE_AWS_BATCH_JOB_QUEUE"),
+            execution_role=os.environ.get("SNAKEMAKE_AWS_BATCH_EXECUTION_ROLE"),
         )
 
     def get_assume_shared_fs(self) -> bool:
