@@ -23,10 +23,11 @@ class BATCH_JOB_RESOURCE_REQUIREMENT_TYPE(Enum):
     MEMORY = "MEMEORY"
 
 class BatchJobBuilder:
-    def __init__(self, job: JobExecutorInterface,
+    def __init__(self, logger, job: JobExecutorInterface,
                  container_image: str,
                  settings: ExecutorSettings,
                  batch_client: BatchClient=None):
+        self.logger = logger
         self.job = job
         self.container_image = container_image
         self.settings = settings
@@ -42,9 +43,11 @@ class BatchJobBuilder:
         vcpu = str(self.job.resources.get("_cores", str(1)))
         mem = str(self.job.resources.get("mem_mb", str(2048)))
 
+        job_command = _generate_snakemake_command(self.job)
+
         container_properties = {
             "image": self.container_image,
-            "command": [SNAKEMAKE_COMMAND],
+            "command": [job_command],
             "jobRoleArn": self.settings.job_role,
             "privileged": True,
             "resourceRequirements": [
@@ -54,14 +57,16 @@ class BatchJobBuilder:
             ],
         }
 
+        timeout = dict()
         tags = self.settings.tags if isinstance(self.settings.tags, dict) else dict()
         try:
             job_def = self.batch_client.client.register_job_definition(
                 jobDefinitionName=job_definition_name,
                 type=BATCH_JOB_DEFINITION_TYPE.CONTAINER.value,
                 containerProperties=container_properties,
-                platformCapabilities=[BATCH_JOB_PLATFORM_CAPABILITIES.EC2.value],
+                timeout=timeout,
                 tags=tags,
+                platformCapabilities=[BATCH_JOB_PLATFORM_CAPABILITIES.EC2.value],
             )
             self.created_job_defs.append(job_def)
             return job_def, job_name
@@ -75,7 +80,6 @@ class BatchJobBuilder:
 
     def submit_job(self):
         job_def, job_name = self.build_job_definition()
-        job_command = self._generate_snakemake_command(self.job)
 
         job_params = {
             "jobName": job_name,
@@ -83,22 +87,7 @@ class BatchJobBuilder:
             "jobDefinition": "{}:{}".format(
                 job_def["jobDefinitionName"], job_def["revision"]
             ),
-            "containerOverrides": {
-                "command": job_command,
-                "resourceRequirements": [
-                    {"type": "VCPU", "value": str(self.job.resources.get("_cores", str(1)))},
-                    {"type": "MEMORY", "value": str(self.job.resources.get("mem_mb", str(2048)))},
-                ],
-            },
         }
-
-        if self.settings.tags:
-            job_params["tags"] = self.settings.tags
-
-        if self.settings.task_timeout is not None:
-            job_params["timeout"] = {
-                "attemptDurationSeconds": self.settings.task_timeout
-            }
 
         try:
             submitted = self.batch_client.client.submit_job(**job_params)
