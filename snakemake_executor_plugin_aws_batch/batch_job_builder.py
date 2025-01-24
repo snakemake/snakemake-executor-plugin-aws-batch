@@ -26,11 +26,13 @@ class BatchJobBuilder:
     def __init__(self, logger, job: JobExecutorInterface,
                  container_image: str,
                  settings: ExecutorSettings,
+                 job_command: str,
                  batch_client: BatchClient=None):
         self.logger = logger
         self.job = job
         self.container_image = container_image
         self.settings = settings
+        self.job_command = job_command
         self.batch_client = batch_client
         self.created_job_defs = []
 
@@ -43,11 +45,9 @@ class BatchJobBuilder:
         vcpu = str(self.job.resources.get("_cores", str(1)))
         mem = str(self.job.resources.get("mem_mb", str(2048)))
 
-        job_command = self._generate_snakemake_command()
-
         container_properties = {
             "image": self.container_image,
-            "command": [job_command],
+            "command": [self.job_command],
             "jobRoleArn": self.settings.job_role,
             "privileged": True,
             "resourceRequirements": [
@@ -72,11 +72,6 @@ class BatchJobBuilder:
             return job_def, job_name
         except Exception as e:
             raise WorkflowError(e)
-
-    def _generate_snakemake_command(self) -> str:
-        """generates the snakemake command for the job"""
-        exec_job = self.format_job_exec(self.job)
-        return ["sh", "-c", shlex.quote(exec_job)]
 
     def submit_job(self):
         job_def, job_name = self.build_job_definition()

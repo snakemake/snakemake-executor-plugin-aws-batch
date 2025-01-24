@@ -1,4 +1,5 @@
 from dataclasses import dataclass, field
+import shlex
 from pprint import pformat
 from typing import List, Generator, Optional
 from snakemake_executor_plugin_aws_batch import BatchJobDescriber, BatchClient, BatchJobBuilder
@@ -124,8 +125,17 @@ class Executor(RemoteExecutor):
         # snakemake_interface_executor_plugins.executors.base.SubmittedJobInfo.
         # If required, make sure to pass the job's id to the job_info object, as keyword
         # argument 'external_job_id'.
+
+        remote_command = f"/bin/bash -c {shlex.quote(self.format_job_exec(job))}"
+        self.logger.debug(f"Remote command: {remote_command}")
+
         try:
-            job_definition = BatchJobBuilder()
+            job_definition = BatchJobBuilder(logger=self.logger, 
+                                             job=job,
+                                             container_image=self.container_image,
+                                             settings=self.settings,
+                                             job_command=remote_command,
+                                             batch_client=self.batch_client)
             job_info = job_definition.submit()
             self.logger.debug(
                 "AWS Batch job submitted with queue {}, jobId {} and tags {}".format(
