@@ -1,11 +1,13 @@
 import uuid
-from batch_client import BatchClient
 from snakemake.exceptions import WorkflowError
 import shlex
 from snakemake_interface_executor_plugins.jobs import (
     JobExecutorInterface,
 )
 from enum import Enum
+from snakemake_executor_plugin_aws_batch import BatchClient, ExecutorSettings
+
+SNAKEMAKE_COMMAND = "snakemake"
 
 class BATCH_JOB_DEFINITION_TYPE(Enum):
     CONTAINER = "container"
@@ -15,12 +17,20 @@ class BATCH_JOB_PLATFORM_CAPABILITIES(Enum):
     FARGATE = "FARGATE"
     EC2 = "EC2"
 
+class BATCH_JOB_RESOURCE_REQUIREMENT_TYPE(Enum):
+    GPU = "GPU"
+    VCPU = "VCPU"
+    MEMORY = "MEMEORY"
+
 class BatchJobBuilder:
-    def __init__(self, job, container_image, settings, batch_client=None):
+    def __init__(self, job: JobExecutorInterface,
+                 container_image: str,
+                 settings: ExecutorSettings,
+                 batch_client: BatchClient=None):
         self.job = job
         self.container_image = container_image
         self.settings = settings
-        self.batch_client = batch_client or BatchClient()
+        self.batch_client = batch_client
         self.created_job_defs = []
 
     def build_job_definition(self):
@@ -28,21 +38,20 @@ class BatchJobBuilder:
         job_name = f"snakejob-{self.job.name}-{job_uuid}"
         job_definition_name = f"snakejob-def-{self.job.name}-{job_uuid}"
 
+        gpu = str(self.job.resources.get("_gpus", str(0)))
         vcpu = str(self.job.resources.get("_cores", str(1)))
         mem = str(self.job.resources.get("mem_mb", str(2048)))
 
         container_properties = {
-            "command": ["snakemake"],
             "image": self.container_image,
+            "command": [SNAKEMAKE_COMMAND],
+            "jobRoleArn": self.settings.job_role,
             "privileged": True,
             "resourceRequirements": [
-                {"type": "VCPU", "value": vcpu},
-                {"type": "MEMORY", "value": mem},
+                {"type": BATCH_JOB_RESOURCE_REQUIREMENT_TYPE.GPU.value, "value": gpu},
+                {"type": BATCH_JOB_RESOURCE_REQUIREMENT_TYPE.VCPU.value, "value": vcpu},
+                {"type": BATCH_JOB_RESOURCE_REQUIREMENT_TYPE.MEMORY.value, "value": mem},
             ],
-            "networkConfiguration": {
-                "assignPublicIp": "ENABLED",
-            },
-            "executionRoleArn": self.settings.execution_role,
         }
 
         tags = self.settings.tags if isinstance(self.settings.tags, dict) else dict()
@@ -51,7 +60,7 @@ class BatchJobBuilder:
                 jobDefinitionName=job_definition_name,
                 type=BATCH_JOB_DEFINITION_TYPE.CONTAINER.value,
                 containerProperties=container_properties,
-                platformCapabilities=[BATCH_JOB_PLATFORM_CAPABILITIES.FARGATE.value],
+                platformCapabilities=[BATCH_JOB_PLATFORM_CAPABILITIES.EC2.value],
                 tags=tags,
             )
             self.created_job_defs.append(job_def)

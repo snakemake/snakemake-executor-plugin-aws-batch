@@ -1,6 +1,5 @@
 from dataclasses import dataclass, field
 from pprint import pformat
-import shlex
 from typing import List, Generator, Optional
 from snakemake_executor_plugin_aws_batch import BatchJobDescriber, BatchClient, BatchJobBuilder
 from snakemake_interface_executor_plugins.executors.base import SubmittedJobInfo
@@ -103,7 +102,7 @@ common_settings = CommonSettings(
 class Executor(RemoteExecutor):
     def __post_init__(self):
 
-        # set snakemake/snakemake container image
+        # snakemake/snakemake:latest container image
         self.container_image = self.workflow.remote_execution_settings.container_image
 
         # access executor specific settings
@@ -125,9 +124,9 @@ class Executor(RemoteExecutor):
         # snakemake_interface_executor_plugins.executors.base.SubmittedJobInfo.
         # If required, make sure to pass the job's id to the job_info object, as keyword
         # argument 'external_job_id'.
-
         try:
-            job_info = BatchJobBuilder().submit()
+            job_definition = BatchJobBuilder()
+            job_info = job_definition.submit()
             self.logger.debug(
                 "AWS Batch job submitted with queue {}, jobId {} and tags {}".format(
                     self.settings.job_queue, job_info["jobId"], self.settings.tags

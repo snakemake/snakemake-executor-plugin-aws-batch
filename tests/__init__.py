@@ -12,7 +12,6 @@ class TestWorkflowsBase(snakemake.common.tests.TestWorkflowsMinioPlayStorageBase
         return "aws-batch"
 
     def get_executor_settings(self) -> Optional[ExecutorSettingsBase]:
-        # instantiate ExecutorSettings of this plugin as appropriate
         return ExecutorSettings(
             region=os.environ.get("SNAKEMAKE_AWS_BATCH_REGION", "us-east-1"),
             job_queue=os.environ.get("SNAKEMAKE_AWS_BATCH_JOB_QUEUE"),
