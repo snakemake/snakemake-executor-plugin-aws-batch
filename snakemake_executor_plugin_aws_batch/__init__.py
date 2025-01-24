@@ -1,13 +1,8 @@
 from dataclasses import dataclass, field
 from pprint import pformat
-import boto3
-import uuid
-import heapq
-import botocore
 import shlex
-import time
-import threading
 from typing import List, Generator, Optional
+from snakemake_executor_plugin_aws_batch import BatchJobDescriber, BatchClient, BatchJobBuilder
 from snakemake_interface_executor_plugins.executors.base import SubmittedJobInfo
 from snakemake_interface_executor_plugins.executors.remote import RemoteExecutor
 from snakemake_interface_executor_plugins.settings import (
@@ -28,16 +23,6 @@ from snakemake_interface_common.exceptions import WorkflowError
 # of None or anything else that makes sense in your case.
 @dataclass
 class ExecutorSettings(ExecutorSettingsBase):
-    access_key_id: Optional[int] = field(
-        default=None,
-        metadata={"help": "AWS access key id", "env_var": True, "required": False},
-        repr=False,
-    )
-    access_key: Optional[int] = field(
-        default=None,
-        metadata={"help": "AWS access key", "env_var": True, "required": False},
-        repr=False,
-    )
     region: Optional[int] = field(
         default=None,
         metadata={
@@ -45,29 +30,6 @@ class ExecutorSettings(ExecutorSettingsBase):
             "env_var": False,
             "required": True,
         },
-    )
-    fsap_id: Optional[str] = (
-        field(
-            default=None,
-            metadata={
-                "help": (
-                    "The fsap id of the EFS instance you want to use that "
-                    "is shared with your local environment"
-                ),
-                "env_var": False,
-                "required": False,
-            },
-        ),
-    )
-    efs_project_path: Optional[str] = (
-        field(
-            default=None,
-            metadata={
-                "help": "The EFS path that contains the project Snakemake is running",
-                "env_var": False,
-                "required": False,
-            },
-        ),
     )
     job_queue: Optional[str] = field(
         default=None,
@@ -140,6 +102,7 @@ common_settings = CommonSettings(
 # Implementation of your executor
 class Executor(RemoteExecutor):
     def __post_init__(self):
+
         # set snakemake/snakemake container image
         self.container_image = self.workflow.remote_execution_settings.container_image
 
@@ -149,49 +112,8 @@ class Executor(RemoteExecutor):
 
         # keep track of job definitions
         self.created_job_defs = list()
-        self.mount_path = None
         self._describer = BatchJobDescriber()
-
-        # init batch client
-        try:
-            self.batch_client = (
-                boto3.Session().client(  # Session() needed for thread safety
-                    "batch",
-                    aws_access_key_id=self.settings.access_key_id,
-                    aws_secret_access_key=self.settings.access_key,
-                    region_name=self.settings.region,
-                    config=botocore.config.Config(
-                        retries={"max_attempts": 5, "mode": "standard"}
-                    ),
-                )
-            )
-        except Exception as e:
-            raise WorkflowError(e)
-
-    # TODO:
-    # def _prepare_mounts(self):
-    #     """
-    #     Prepare the "volumes" and "mountPoints" for the Batch job definition,
-    #     assembling the in-container filesystem with the shared working directory,
-    #     read-only input files, and command/stdout/stderr files.
-    #     """
-
-    #     # EFS mount point
-    #     volumes = [
-    #         {
-    #             "name": "efs",
-    #             "efsVolumeConfiguration": {
-    #                 "fileSystemId": self.fs_id,
-    #                 "transitEncryption": "ENABLED",
-    #             },
-    #         }
-    #     ]
-    #     volumes[0]["efsVolumeConfiguration"]["authorizationConfig"] = {
-    #         "accessPointId": self.fsap_id
-    #     }
-    #     mount_points = [{"containerPath": self.mount_path, "sourceVolume": "efs"}]
-
-    #     return volumes, mount_points
+        self.batch_clint = BatchClient(region_name=self.settings.region)
 
     def run_job(self, job: JobExecutorInterface):
         # Implement here how to run a job.
@@ -204,88 +126,11 @@ class Executor(RemoteExecutor):
         # If required, make sure to pass the job's id to the job_info object, as keyword
         # argument 'external_job_id'.
 
-        # set job name
-        job_uuid = str(uuid.uuid4())
-        job_name = f"snakejob-{job.name}-{job_uuid}"
-
-        # set job definition name
-        job_definition_name = f"snakejob-def-{job.name}-{job_uuid}"
-        job_definition_type = "container"
-
-        # get job resources or default
-        vcpu = str(job.resources.get("_cores", str(1)))
-        mem = str(job.resources.get("mem_mb", str(2048)))
-
-        # job definition container properties
-        container_properties = {
-            "command": ["snakemake"],
-            "image": self.container_image,
-            # fargate required privileged False
-            "privileged": False,
-            "resourceRequirements": [
-                # resource requirements have to be compatible
-                # see: https://docs.aws.amazon.com/batch/latest/APIReference/API_ResourceRequirement.html # noqa
-                {"type": "VCPU", "value": vcpu},
-                {"type": "MEMORY", "value": mem},
-            ],
-            "networkConfiguration": {
-                "assignPublicIp": "ENABLED",
-            },
-            "executionRoleArn": self.settings.execution_role,
-        }
-
-        # TODO: or not todo ?
-        # (
-        #     container_properties["volumes"],
-        #     container_properties["mountPoints"],
-        # ) = self._prepare_mounts()
-
-        # register the job definition
-        tags = self.settings.tags if isinstance(self.settings.tags, dict) else dict()
         try:
-            job_def = self.batch_client.register_job_definition(
-                jobDefinitionName=job_definition_name,
-                type=job_definition_type,
-                containerProperties=container_properties,
-                platformCapabilities=["FARGATE"],
-                tags=tags,
-            )
-            self.created_job_defs.append(job_def)
-        except Exception as e:
-            raise WorkflowError(e)
-
-        job_command = self._generate_snakemake_command(job)
-
-        # configure job parameters
-        job_params = {
-            "jobName": job_name,
-            "jobQueue": self.settings.job_queue,
-            "jobDefinition": "{}:{}".format(
-                job_def["jobDefinitionName"], job_def["revision"]
-            ),
-            "containerOverrides": {
-                "command": job_command,
-                "resourceRequirements": [
-                    {"type": "VCPU", "value": vcpu},
-                    {"type": "MEMORY", "value": mem},
-                ],
-            },
-        }
-
-        if self.settings.tags:
-            job_params["tags"] = self.settings.tags
-
-        if self.settings.task_timeout is not None:
-            job_params["timeout"] = {
-                "attemptDurationSeconds": self.settings.task_timeout
-            }
-
-        # submit the job
-        try:
-            submitted = self.batch_client.submit_job(**job_params)
+            job_info = BatchJobBuilder().submit()
             self.logger.debug(
                 "AWS Batch job submitted with queue {}, jobId {} and tags {}".format(
-                    self.settings.job_queue, submitted["jobId"], self.settings.tags
+                    self.settings.job_queue, job_info["jobId"], self.settings.tags
                 )
             )
         except Exception as e:
@@ -294,18 +139,13 @@ class Executor(RemoteExecutor):
         self.report_job_submission(
             SubmittedJobInfo(
                 job=job,
-                external_jobid=submitted["jobId"],
+                external_jobid=job_info["jobId"],
                 aux={
                     "jobs_params": job_params,
                     "job_def_arn": job_def["jobDefinitionArn"],
                 },
             )
         )
-
-    def _generate_snakemake_command(self, job: JobExecutorInterface) -> str:
-        """generates the snakemake command for the job"""
-        exec_job = self.format_job_exec(job)
-        return ["sh", "-c", shlex.quote(exec_job)]
 
     async def check_active_jobs(
         self, active_jobs: List[SubmittedJobInfo]
@@ -451,71 +291,3 @@ class Executor(RemoteExecutor):
         for j in active_jobs:
             self._terminate_job(j)
             self._deregister_job(j)
-
-
-class BatchJobDescriber:
-    """
-    This singleton class handles calling the AWS Batch DescribeJobs API with up to 100
-    job IDs per request, then dispensing each job description to the thread interested
-    in it. This helps avoid AWS API request rate limits when tracking concurrent jobs.
-    """
-
-    JOBS_PER_REQUEST = 100  # maximum jobs per DescribeJob request
-
-    def __init__(self):
-        self.lock = threading.Lock()
-        self.last_request_time = 0
-        self.job_queue = []
-        self.jobs = {}
-
-    def describe(self, aws, job_id, period):
-        """get the latest Batch job description"""
-        while True:
-            with self.lock:
-                if job_id not in self.jobs:
-                    # register new job to be described ASAP
-                    heapq.heappush(self.job_queue, (0.0, job_id))
-                    self.jobs[job_id] = None
-                # update as many job descriptions as possible
-                self._update(aws, period)
-                # return the desired job description if we have it
-                desc = self.jobs[job_id]
-                if desc:
-                    return desc
-            # otherwise wait (outside the lock) and try again
-            time.sleep(period / 4)
-
-    def unsubscribe(self, job_id):
-        """unsubscribe from job_id when no longer interested"""
-        with self.lock:
-            if job_id in self.jobs:
-                del self.jobs[job_id]
-
-    def _update(self, aws, period):
-        # if enough time has passed since our last DescribeJobs request
-        if time.time() - self.last_request_time >= period:
-            # take the N least-recently described jobs
-            job_ids = set()
-            assert self.job_queue
-            while self.job_queue and len(job_ids) < self.JOBS_PER_REQUEST:
-                job_id = heapq.heappop(self.job_queue)[1]
-                assert job_id not in job_ids
-                if job_id in self.jobs:
-                    job_ids.add(job_id)
-            if not job_ids:
-                return
-            # describe them
-            try:
-                job_descs = aws.describe_jobs(jobs=list(job_ids))
-            finally:
-                # always: bump last_request_time and re-enqueue these jobs
-                self.last_request_time = time.time()
-                for job_id in job_ids:
-                    heapq.heappush(self.job_queue, (self.last_request_time, job_id))
-            # update self.jobs with the new descriptions
-            for job_desc in job_descs["jobs"]:
-                job_ids.remove(job_desc["jobId"])
-                self.jobs[job_desc["jobId"]] = job_desc
-            assert (
-                not job_ids
-            ), "AWS Batch DescribeJobs didn't return all expected results"
