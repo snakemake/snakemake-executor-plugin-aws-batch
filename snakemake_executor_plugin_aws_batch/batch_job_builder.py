@@ -27,7 +27,7 @@ class BatchJobBuilder:
                  container_image: str,
                  settings: ExecutorSettings,
                  job_command: str,
-                 batch_client: BatchClient=None):
+                 batch_client: BatchClient):
         self.logger = logger
         self.job = job
         self.container_image = container_image
@@ -85,7 +85,7 @@ class BatchJobBuilder:
         }
 
         try:
-            submitted = self.batch_client.client.submit_job(**job_params)
+            submitted = self.batch_client.submit_job(**job_params)
             self.logger.debug(
                 "AWS Batch job submitted with queue {}, jobId {} and tags {}".format(
                     self.settings.job_queue, submitted["jobId"], self.settings.tags

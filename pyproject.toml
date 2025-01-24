@@ -10,9 +10,9 @@ keywords = ["snakemake", "plugin", "executor", "aws-batch"]
 
 [tool.poetry.dependencies]
 python = "^3.11"
-snakemake-interface-common = "^1.15.0"
-snakemake-interface-executor-plugins = "^8.1.1"
-boto3 = "^1.33.11"
+snakemake-interface-common = "^1.17.4"
+snakemake-interface-executor-plugins = "^9.3.2"
+boto3 = "^1.36.5"
 
 [tool.poetry.group.dev.dependencies]
 black = "^23.11.0"
