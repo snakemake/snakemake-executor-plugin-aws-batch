@@ -43,7 +43,7 @@ class BatchJobBuilder:
         vcpu = str(self.job.resources.get("_cores", str(1)))
         mem = str(self.job.resources.get("mem_mb", str(2048)))
 
-        job_command = _generate_snakemake_command(self.job)
+        job_command = self._generate_snakemake_command()
 
         container_properties = {
             "image": self.container_image,
@@ -73,9 +73,9 @@ class BatchJobBuilder:
         except Exception as e:
             raise WorkflowError(e)
 
-    def _generate_snakemake_command(self, job: JobExecutorInterface) -> str:
+    def _generate_snakemake_command(self) -> str:
         """generates the snakemake command for the job"""
-        exec_job = self.format_job_exec(job)
+        exec_job = self.format_job_exec(self.job)
         return ["sh", "-c", shlex.quote(exec_job)]
 
     def submit_job(self):
