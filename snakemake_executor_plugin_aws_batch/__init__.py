@@ -1,13 +1,16 @@
 __author__ = "Jake VanCampen, Johannes Köster"
-__copyright__ = f"Copyright 2025, Snakemake community"
+__copyright__ = "Copyright 2025, Snakemake community"
 __email__ = "jake.vancampen7@gmail.com"
 __license__ = "MIT"
 
 from dataclasses import dataclass, field
 import shlex
+from typing import Union
 from pprint import pformat
-from typing import List, Generator, Optional
-from snakemake_executor_plugin_aws_batch import BatchJobDescriber, BatchClient, BatchJobBuilder
+from typing import List, AsyncGenerator, Optional
+from snakemake_executor_plugin_aws_batch.batch_client import BatchClient
+from snakemake_executor_plugin_aws_batch.batch_job_builder import BatchJobBuilder 
+from snakemake_executor_plugin_aws_batch.batch_descriptor import BatchJobDescriber
 from snakemake_interface_executor_plugins.executors.base import SubmittedJobInfo
 from snakemake_interface_executor_plugins.executors.remote import RemoteExecutor
 from snakemake_interface_executor_plugins.settings import (
@@ -135,7 +138,7 @@ class Executor(RemoteExecutor):
         self.logger.debug(f"Remote command: {remote_command}")
 
         try:
-            job_definition = BatchJobBuilder(logger=self.logger, 
+            job_definition = BatchJobBuilder(logger=self.logger,
                                              job=job,
                                              container_image=self.container_image,
                                              settings=self.settings,
@@ -155,15 +158,15 @@ class Executor(RemoteExecutor):
                 job=job,
                 external_jobid=job_info["jobId"],
                 aux={
-                    "jobs_params": job_params,
-                    "job_def_arn": job_def["jobDefinitionArn"],
+                    "jobs_params": job_info["job_params"],
+                    "job_def_arn": job_definition["jobDefinitionArn"],
                 },
             )
         )
 
     async def check_active_jobs(
         self, active_jobs: List[SubmittedJobInfo]
-    ) -> Generator[SubmittedJobInfo, None, None]:
+    ) -> AsyncGenerator[SubmittedJobInfo, None, None]:
         # Check the status of active jobs.
 
         # You have to iterate over the given list active_jobs.
@@ -196,7 +199,7 @@ class Executor(RemoteExecutor):
                 else:
                     yield job
 
-    def _get_job_status(self, job: SubmittedJobInfo) -> (int, Optional[str]):
+    def _get_job_status(self, job: SubmittedJobInfo) -> Union[int, Optional[str]]:
         """poll for Batch job success or failure
 
         returns exits code and failure information if exit code is not 0

@@ -1,33 +1,41 @@
 import uuid
 from snakemake.exceptions import WorkflowError
-import shlex
 from snakemake_interface_executor_plugins.jobs import (
     JobExecutorInterface,
 )
 from enum import Enum
-from snakemake_executor_plugin_aws_batch import BatchClient, ExecutorSettings
+from snakemake_executor_plugin_aws_batch import ExecutorSettings
+from snakemake_executor_plugin_aws_batch.batch_client import BatchClient
 
 SNAKEMAKE_COMMAND = "snakemake"
+
 
 class BATCH_JOB_DEFINITION_TYPE(Enum):
     CONTAINER = "container"
     MULTINODE = "multinode"
 
+
 class BATCH_JOB_PLATFORM_CAPABILITIES(Enum):
     FARGATE = "FARGATE"
     EC2 = "EC2"
+
 
 class BATCH_JOB_RESOURCE_REQUIREMENT_TYPE(Enum):
     GPU = "GPU"
     VCPU = "VCPU"
     MEMORY = "MEMORY"
 
+
 class BatchJobBuilder:
-    def __init__(self, logger, job: JobExecutorInterface,
-                 container_image: str,
-                 settings: ExecutorSettings,
-                 job_command: str,
-                 batch_client: BatchClient):
+    def __init__(
+        self,
+        logger,
+        job: JobExecutorInterface,
+        container_image: str,
+        settings: ExecutorSettings,
+        job_command: str,
+        batch_client: BatchClient,
+    ):
         self.logger = logger
         self.job = job
         self.container_image = container_image
@@ -53,7 +61,10 @@ class BatchJobBuilder:
             "resourceRequirements": [
                 {"type": BATCH_JOB_RESOURCE_REQUIREMENT_TYPE.GPU.value, "value": gpu},
                 {"type": BATCH_JOB_RESOURCE_REQUIREMENT_TYPE.VCPU.value, "value": vcpu},
-                {"type": BATCH_JOB_RESOURCE_REQUIREMENT_TYPE.MEMORY.value, "value": mem},
+                {
+                    "type": BATCH_JOB_RESOURCE_REQUIREMENT_TYPE.MEMORY.value,
+                    "value": mem,
+                },  # noqa
             ],
         }
 
