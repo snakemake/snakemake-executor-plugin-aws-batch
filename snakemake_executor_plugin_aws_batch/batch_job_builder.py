@@ -58,7 +58,6 @@ class BatchJobBuilder:
             "jobRoleArn": self.settings.job_role,
             "privileged": True,
             "resourceRequirements": [
-                {"type": BATCH_JOB_RESOURCE_REQUIREMENT_TYPE.GPU.value, "value": gpu},
                 {"type": BATCH_JOB_RESOURCE_REQUIREMENT_TYPE.VCPU.value, "value": vcpu},
                 {
                     "type": BATCH_JOB_RESOURCE_REQUIREMENT_TYPE.MEMORY.value,
@@ -67,7 +66,12 @@ class BatchJobBuilder:
             ],
         }
 
-        timeout = dict()
+        if int(gpu) > 0:
+            container_properties["resourceRequirements"].append(
+                {"type": BATCH_JOB_RESOURCE_REQUIREMENT_TYPE.GPU.value, "value": gpu}
+            )
+
+        timeout = {"attemptDurationSeconds": self.settings.task_timeout}
         tags = self.settings.tags if isinstance(self.settings.tags, dict) else dict()
         try:
             job_def = self.batch_client.client.register_job_definition(
