@@ -34,3 +34,12 @@ class BatchClient(AWSClient):
         :param region_name: The region name to use for the client (optional).
         """
         super().__init__("batch", region_name)
+
+    def submit_job(self, **kwargs):
+        """
+        Submit a job to AWS Batch.
+
+        :param kwargs: The keyword arguments to pass to the submit_job method.
+        :return: The response from the submit_job method.
+        """
+        return self.client.submit_job(**kwargs)

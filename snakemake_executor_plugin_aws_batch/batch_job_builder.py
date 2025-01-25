@@ -83,7 +83,7 @@ class BatchJobBuilder:
         except Exception as e:
             raise WorkflowError(e)
 
-    def submit_job(self):
+    def submit(self):
         job_def, job_name = self.build_job_definition()
 
         job_params = {

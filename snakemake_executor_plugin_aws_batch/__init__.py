@@ -160,7 +160,7 @@ class Executor(RemoteExecutor):
                 external_jobid=job_info["jobId"],
                 aux={
                     "jobs_params": job_info["job_params"],
-                    "job_def_arn": job_definition["jobDefinitionArn"],
+                    "job_def_arn": job_info["jobDefinitionArn"],
                 },
             )
         )
