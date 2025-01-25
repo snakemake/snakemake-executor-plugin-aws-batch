@@ -4,7 +4,6 @@ from snakemake_interface_executor_plugins.jobs import (
     JobExecutorInterface,
 )
 from enum import Enum
-from snakemake_executor_plugin_aws_batch import ExecutorSettings
 from snakemake_executor_plugin_aws_batch.batch_client import BatchClient
 
 SNAKEMAKE_COMMAND = "snakemake"
@@ -32,7 +31,7 @@ class BatchJobBuilder:
         logger,
         job: JobExecutorInterface,
         container_image: str,
-        settings: ExecutorSettings,
+        settings,
         job_command: str,
         batch_client: BatchClient,
     ):

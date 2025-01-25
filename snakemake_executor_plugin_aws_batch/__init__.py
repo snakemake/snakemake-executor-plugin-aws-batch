@@ -9,7 +9,7 @@ from typing import Union
 from pprint import pformat
 from typing import List, AsyncGenerator, Optional
 from snakemake_executor_plugin_aws_batch.batch_client import BatchClient
-from snakemake_executor_plugin_aws_batch.batch_job_builder import BatchJobBuilder 
+from snakemake_executor_plugin_aws_batch.batch_job_builder import BatchJobBuilder
 from snakemake_executor_plugin_aws_batch.batch_descriptor import BatchJobDescriber
 from snakemake_interface_executor_plugins.executors.base import SubmittedJobInfo
 from snakemake_interface_executor_plugins.executors.remote import RemoteExecutor
@@ -110,12 +110,11 @@ common_settings = CommonSettings(
 # Implementation of your executor
 class Executor(RemoteExecutor):
     def __post_init__(self):
-
         # snakemake/snakemake:latest container image
         self.container_image = self.workflow.remote_execution_settings.container_image
 
         # access executor specific settings
-        self.settings: ExecutorSettings = self.workflow.executor_settings
+        self.settings = self.workflow.executor_settings
         self.logger.debug(f"ExecutorSettings: {pformat(self.settings, indent=2)}")
 
         # keep track of job definitions
@@ -138,12 +137,14 @@ class Executor(RemoteExecutor):
         self.logger.debug(f"Remote command: {remote_command}")
 
         try:
-            job_definition = BatchJobBuilder(logger=self.logger,
-                                             job=job,
-                                             container_image=self.container_image,
-                                             settings=self.settings,
-                                             job_command=remote_command,
-                                             batch_client=self.batch_client)
+            job_definition = BatchJobBuilder(
+                logger=self.logger,
+                job=job,
+                container_image=self.container_image,
+                settings=self.settings,
+                job_command=remote_command,
+                batch_client=self.batch_client,
+            )
             job_info = job_definition.submit()
             self.logger.debug(
                 "AWS Batch job submitted with queue {}, jobId {} and tags {}".format(
@@ -166,7 +167,7 @@ class Executor(RemoteExecutor):
 
     async def check_active_jobs(
         self, active_jobs: List[SubmittedJobInfo]
-    ) -> AsyncGenerator[SubmittedJobInfo, None, None]:
+    ) -> AsyncGenerator[SubmittedJobInfo, None]:
         # Check the status of active jobs.
 
         # You have to iterate over the given list active_jobs.
