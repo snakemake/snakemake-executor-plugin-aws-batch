@@ -1,3 +1,8 @@
+__author__ = "Jake VanCampen, Johannes Köster"
+__copyright__ = f"Copyright 2025, Snakemake community"
+__email__ = "jake.vancampen7@gmail.com"
+__license__ = "MIT"
+
 from dataclasses import dataclass, field
 import shlex
 from pprint import pformat
