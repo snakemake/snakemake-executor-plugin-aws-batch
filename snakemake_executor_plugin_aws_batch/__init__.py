@@ -113,7 +113,7 @@ class Executor(RemoteExecutor):
         # keep track of job definitions
         self.created_job_defs = list()
         self._describer = BatchJobDescriber()
-        self.batch_clint = BatchClient(region_name=self.settings.region)
+        self.batch_client = BatchClient(region_name=self.settings.region)
 
     def run_job(self, job: JobExecutorInterface):
         # Implement here how to run a job.

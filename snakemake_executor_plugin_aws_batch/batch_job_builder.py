@@ -20,7 +20,7 @@ class BATCH_JOB_PLATFORM_CAPABILITIES(Enum):
 class BATCH_JOB_RESOURCE_REQUIREMENT_TYPE(Enum):
     GPU = "GPU"
     VCPU = "VCPU"
-    MEMORY = "MEMEORY"
+    MEMORY = "MEMORY"
 
 class BatchJobBuilder:
     def __init__(self, logger, job: JobExecutorInterface,
