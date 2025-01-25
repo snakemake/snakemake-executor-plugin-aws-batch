@@ -23,8 +23,8 @@ class TestWorkflowsBase(snakemake.common.tests.TestWorkflowsMinioPlayStorageBase
 
     def get_remote_execution_settings(
         self,
-    ) -> snakemake.settings.RemoteExecutionSettings:
-        return snakemake.settings.RemoteExecutionSettings(
+    ) -> snakemake.settings.types.RemoteExecutionSettings:
+        return snakemake.settings.types.RemoteExecutionSettings(
             seconds_between_status_checks=5,
             envvars=self.get_envvars(),
         )
