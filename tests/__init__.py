@@ -13,9 +13,9 @@ class TestWorkflowsBase(snakemake.common.tests.TestWorkflowsMinioPlayStorageBase
 
     def get_executor_settings(self) -> Optional[ExecutorSettingsBase]:
         return ExecutorSettings(
-            region=os.environ.get("SNAKEMAKE_AWS_BATCH_REGION", "us-east-1"),
+            region=os.environ.get("SNAKEMAKE_AWS_BATCH_REGION", "us-west-2"),
             job_queue=os.environ.get("SNAKEMAKE_AWS_BATCH_JOB_QUEUE"),
-            execution_role=os.environ.get("SNAKEMAKE_AWS_BATCH_EXECUTION_ROLE"),
+            job_role=os.environ.get("SNAKEMAKE_AWS_BATCH_JOB_ROLE"),
         )
 
     def get_assume_shared_fs(self) -> bool:

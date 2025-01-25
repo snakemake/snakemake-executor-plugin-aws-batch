@@ -39,10 +39,10 @@ class ExecutorSettings(ExecutorSettingsBase):
             "required": True,
         },
     )
-    execution_role: Optional[str] = field(
+    job_role: Optional[str] = field(
         default=None,
         metadata={
-            "help": "The AWS execution role ARN that is used for running the tasks",
+            "help": "The AWS job role ARN that is used for running the tasks",
             "env_var": True,
             "required": True,
         },
