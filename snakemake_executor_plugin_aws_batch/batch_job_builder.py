@@ -85,7 +85,7 @@ class BatchJobBuilder:
             self.created_job_defs.append(job_def)
             return job_def, job_name
         except Exception as e:
-            raise WorkflowError(e)
+            raise WorkflowError(f"Failed to register job definition: {e}") from e
 
     def submit(self):
         job_def, job_name = self.build_job_definition()
@@ -107,4 +107,4 @@ class BatchJobBuilder:
             )
             return submitted
         except Exception as e:
-            raise WorkflowError(e)
+            raise WorkflowError(f"Failed to submit job: {e}") from e
