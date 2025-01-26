@@ -5,7 +5,6 @@ __license__ = "MIT"
 
 from dataclasses import dataclass, field
 import shlex
-from typing import Union
 from pprint import pformat
 from typing import List, AsyncGenerator, Optional
 from snakemake_executor_plugin_aws_batch.batch_client import BatchClient
@@ -200,7 +199,7 @@ class Executor(RemoteExecutor):
                 else:
                     yield job
 
-    def _get_job_status(self, job: SubmittedJobInfo) -> Union[int, Optional[str]]:
+    def _get_job_status(self, job: SubmittedJobInfo) -> tuple[int, Optional[str]]:
         """poll for Batch job success or failure
 
         returns exits code and failure information if exit code is not 0
