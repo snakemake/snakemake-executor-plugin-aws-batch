@@ -48,6 +48,7 @@ class BatchJobBuilder:
         job_name = f"snakejob-{self.job.name}-{job_uuid}"
         job_definition_name = f"snakejob-def-{self.job.name}-{job_uuid}"
 
+        # TODO: validate resources
         gpu = str(self.job.resources.get("_gpus", str(0)))
         vcpu = str(self.job.resources.get("_cores", str(1)))
         mem = str(self.job.resources.get("mem_mb", str(2048)))
