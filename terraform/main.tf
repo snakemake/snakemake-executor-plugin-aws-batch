@@ -62,6 +62,13 @@ resource "aws_security_group" "sg01" {
   name = var.aws_security_group_name
   vpc_id = aws_vpc.vpc01.id
 
+  ingress {
+    from_port   = 0
+    to_port     = 0
+    protocol    = "-1"
+    cidr_blocks = ["0.0.0.0/0"]
+  }
+
   egress {
     from_port   = 0
     to_port     = 0
@@ -80,6 +87,24 @@ resource "aws_subnet" "subnet01" {
 
   # jobs will be stuck in runnable state if this is not set
   map_public_ip_on_launch = true
+}
+
+resource "aws_internet_gateway" "igw" {
+  vpc_id = aws_vpc.vpc01.id
+}
+
+resource "aws_route_table" "public_rt" {
+  vpc_id = aws_vpc.vpc01.id
+
+  route {
+    cidr_block = "0.0.0.0/0"
+    gateway_id = aws_internet_gateway.igw.id
+  }
+}
+
+resource "aws_route_table_association" "public_rt_assoc" {
+  subnet_id      = aws_subnet.subnet01.id
+  route_table_id = aws_route_table.public_rt.id
 }
 
 resource "aws_batch_compute_environment" "sample" {
