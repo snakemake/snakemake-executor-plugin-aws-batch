@@ -60,6 +60,7 @@ resource "aws_placement_group" "sample" {
 
 resource "aws_security_group" "sg01" {
   name = var.aws_security_group_name
+  vpc_id = aws_vpc.vpc01.id
 
   egress {
     from_port   = 0
