@@ -58,6 +58,26 @@ resource "aws_placement_group" "sample" {
   strategy = var.aws_placement_group_strategy
 }
 
+resource "aws_security_group" "sg01" {
+  name = var.aws_security_group_name
+
+  egress {
+    from_port   = 0
+    to_port     = 0
+    protocol    = "-1"
+    cidr_blocks = ["0.0.0.0/0"]
+  }
+}
+
+resource "aws_vpc" "vpc01" {
+  cidr_block = var.aws_vpc_cidr_block
+}
+
+resource "aws_subnet" "subnet01" {
+  vpc_id     = aws_vpc.vpc01.id
+  cidr_block = var.aws_subnet_cidr_block
+}
+
 resource "aws_batch_compute_environment" "sample" {
   compute_environment_name = var.aws_batch_compute_environment_name
 
@@ -71,9 +91,9 @@ resource "aws_batch_compute_environment" "sample" {
 
     placement_group = aws_placement_group.sample.name
 
-    security_group_ids = var.aws_batch_security_group_ids
+    security_group_ids = [aws_security_group.sg01.id]
 
-    subnets = var.aws_batch_subnet_ids
+    subnets = [aws_subnet.subnet01.id]
 
     type = var.aws_batch_compute_resource_type
   }
@@ -84,7 +104,7 @@ resource "aws_batch_compute_environment" "sample" {
 }
 
 
-resource "aws_batch_job_queue" "test_queue" {
+resource "aws_batch_job_queue" "snakequeue" {
   name     = var.aws_batch_job_queue_name
   state    = var.aws_batch_job_queue_state
   priority = 1

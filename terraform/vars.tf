@@ -28,20 +28,6 @@ variable "aws_batch_service_role_policy_arn" {
   default     = "arn:aws:iam::aws:policy/service-role/AWSBatchServiceRole"
 }
 
-# default subnet id
-variable "aws_batch_subnet_ids" {
-  description = "The subnet IDs for the AWS Batch compute environment"
-  type        = list(string)
-  default     = ["subnet-9d6142e4"]
-  
-}
-
-# default security group id
-variable "aws_batch_security_group_ids" {
-  description = "The security group IDs for the AWS Batch compute environment"
-  type        = list(string)
-  default     = ["sg-ee1ccb9a"]
-}
 
 variable "aws_placement_group_name" {
   description = "The name of the placement group"
@@ -53,6 +39,24 @@ variable "aws_placement_group_strategy" {
   description = "The strategy of the placement group"
   type        = string
   default     = "cluster"
+}
+
+variable "aws_security_group_name" {
+  description = "The name of the security group"
+  type        = string
+  default     = "sg01"
+}
+
+variable "aws_vpc_cidr_block" {
+  description = "The CIDR block for the VPC"
+  type        = string
+  default     = "10.1.0.0/16"
+}
+
+variable "aws_subnet_cidr_block" {
+  description = "The CIDR block for the subnet"
+  type        = string
+  default     = "10.1.1.0/24"
 }
 
 variable "aws_batch_compute_environment_name" {
