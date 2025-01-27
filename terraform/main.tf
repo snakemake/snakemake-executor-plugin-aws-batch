@@ -77,6 +77,9 @@ resource "aws_vpc" "vpc01" {
 resource "aws_subnet" "subnet01" {
   vpc_id     = aws_vpc.vpc01.id
   cidr_block = var.aws_subnet_cidr_block
+
+  # jobs will be stuck in runnable state if this is not set
+  map_public_ip_on_launch = true
 }
 
 resource "aws_batch_compute_environment" "sample" {

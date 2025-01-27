@@ -26,6 +26,7 @@ class AWSClient:
         return client
 
 
+# client class stub for AWS Batch
 class BatchClient(AWSClient):
     def __init__(self, region_name=None):
         """
@@ -43,3 +44,12 @@ class BatchClient(AWSClient):
         :return: The response from the submit_job method.
         """
         return self.client.submit_job(**kwargs)
+
+    def describe_jobs(self, **kwargs):
+        """
+        Describe jobs in AWS Batch.
+
+        :param kwargs: The keyword arguments to pass to the describe_jobs method.
+        :return: The response from the describe_jobs method.
+        """
+        return self.client.describe_jobs(**kwargs)
