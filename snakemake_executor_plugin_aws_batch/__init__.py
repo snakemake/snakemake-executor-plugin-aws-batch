@@ -153,14 +153,10 @@ class Executor(RemoteExecutor):
         except Exception as e:
             raise WorkflowError(e)
 
+        self.logger.debug(f"Job info: {pformat(job_info, indent=2)}")
         self.report_job_submission(
             SubmittedJobInfo(
-                job=job,
-                external_jobid=job_info["jobId"],
-                aux={
-                    "jobs_params": job_info["job_params"],
-                    "job_def_arn": job_info["jobDefinitionArn"],
-                },
+                job=job, external_jobid=job_info["jobId"], aux=dict(job_info)
             )
         )
 
