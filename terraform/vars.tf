@@ -75,7 +75,7 @@ variable "instance_types" {
 variable "max_vcpus" {
   description = "The maximum number of vCPUs for the compute environment"
   type        = number
-  default     = 2
+  default     = 16
 }
 
 variable "min_vcpus" {

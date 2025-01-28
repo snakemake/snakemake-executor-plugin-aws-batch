@@ -53,3 +53,21 @@ class BatchClient(AWSClient):
         :return: The response from the describe_jobs method.
         """
         return self.client.describe_jobs(**kwargs)
+
+    def deregister_job_definition(self, **kwargs):
+        """
+        Deregister a job definition in AWS Batch.
+
+        :param kwargs: The keyword arguments passed to deregister_job_definition method.
+        :return: The response from the deregister_job_definition method.
+        """
+        return self.client.deregister_job_definition(**kwargs)
+
+    def terminate_job(self, **kwargs):
+        """
+        Terminate a job in AWS Batch.
+
+        :param kwargs: The keyword arguments to pass to the terminate_job method.
+        :return: The response from the terminate_job method.
+        """
+        return self.client.terminate_job(**kwargs)

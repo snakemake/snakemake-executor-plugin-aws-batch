@@ -45,11 +45,11 @@ class BatchJobBuilder:
         self.batch_client = batch_client
         self.created_job_defs = []
 
-    def _make_container_command(remote_command: str) -> List[str]:
+    def _make_container_command(self, remote_command: str) -> List[str]:
         """
         Return docker CMD form of the command
         """
-        return [shlex.quote(part) for part in shlex.split(str)]
+        return [shlex.quote(part) for part in shlex.split(remote_command)]
 
     def build_job_definition(self):
         job_uuid = str(uuid.uuid4())

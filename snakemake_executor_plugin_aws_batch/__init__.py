@@ -111,6 +111,9 @@ class Executor(RemoteExecutor):
         # snakemake/snakemake:latest container image
         self.container_image = self.workflow.remote_execution_settings.container_image
 
+        # set the rate limit for status checks
+        self.next_seconds_between_status_checks = 5
+
         # access executor specific settings
         self.settings = self.workflow.executor_settings
         self.logger.debug(f"ExecutorSettings: {pformat(self.settings, indent=2)}")
@@ -151,7 +154,6 @@ class Executor(RemoteExecutor):
         except Exception as e:
             raise WorkflowError(e)
 
-        self.logger.debug(f"Job info: {pformat(job_info, indent=2)}")
         self.report_job_submission(
             SubmittedJobInfo(
                 job=job, external_jobid=job_info["jobId"], aux=dict(job_info)
@@ -185,11 +187,12 @@ class Executor(RemoteExecutor):
         self.logger.debug(f"Monitoring {len(active_jobs)} active Batch jobs")
         for job in active_jobs:
             async with self.status_rate_limiter:
-                status_code = self._get_job_status(job)
+                status_code, msg = self._get_job_status(job)
                 if status_code == 0:
                     self.report_job_success(job)
                 elif status_code is not None:
-                    self.report_job_error(job)
+                    message = f"AWS Batch job failed. Code: {status_code}, Msg: {msg}."
+                    self.report_job_error(job, msg=message)
                 else:
                     yield job
 
@@ -210,12 +213,10 @@ class Executor(RemoteExecutor):
         exit_code = None
         log_stream_name = None
         job_desc = self._describer.describe(self.batch_client, job.external_jobid, 1)
-        self.logger.debug(f"JOB DESCRIPTION: {job_desc}")
         job_status = job_desc["status"]
 
         # set log stream name if not none
         log_details = {"status": job_status, "jobId": job.external_jobid}
-        self.logger.debug(f"LOG DETAILS: {log_details}")
 
         if "container" in job_desc and "logStreamName" in job_desc["container"]:
             log_stream_name = job_desc["container"]["logStreamName"]
