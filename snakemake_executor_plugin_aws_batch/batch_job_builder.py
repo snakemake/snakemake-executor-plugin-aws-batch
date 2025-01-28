@@ -1,4 +1,6 @@
 import uuid
+import shlex
+from typing import List
 from snakemake.exceptions import WorkflowError
 from snakemake_interface_executor_plugins.jobs import (
     JobExecutorInterface,
@@ -43,6 +45,12 @@ class BatchJobBuilder:
         self.batch_client = batch_client
         self.created_job_defs = []
 
+    def _make_container_command(remote_command: str) -> List[str]:
+        """
+        Return docker CMD form of the command
+        """
+        return [shlex.quote(part) for part in shlex.split(str)]
+
     def build_job_definition(self):
         job_uuid = str(uuid.uuid4())
         job_name = f"snakejob-{self.job.name}-{job_uuid}"
@@ -55,7 +63,8 @@ class BatchJobBuilder:
 
         container_properties = {
             "image": self.container_image,
-            "command": [self.job_command],
+            # command requires a list of strings ( docker CMD format )
+            "command": self._make_container_command(self.job_command),
             "jobRoleArn": self.settings.job_role,
             "privileged": True,
             "resourceRequirements": [

@@ -4,7 +4,6 @@ __email__ = "jake.vancampen7@gmail.com"
 __license__ = "MIT"
 
 from dataclasses import dataclass, field
-import shlex
 from pprint import pformat
 from typing import List, AsyncGenerator, Optional
 from snakemake_executor_plugin_aws_batch.batch_client import BatchClient
@@ -132,8 +131,7 @@ class Executor(RemoteExecutor):
         # If required, make sure to pass the job's id to the job_info object, as keyword
         # argument 'external_job_id'.
 
-        remote_command = f"/bin/bash -c {shlex.quote(self.format_job_exec(job))}"
-        self.logger.debug(f"Remote command: {remote_command}")
+        remote_command = f"/bin/bash -c {self.format_job_exec(job)}"
 
         try:
             job_definition = BatchJobBuilder(
@@ -212,10 +210,12 @@ class Executor(RemoteExecutor):
         exit_code = None
         log_stream_name = None
         job_desc = self._describer.describe(self.batch_client, job.external_jobid, 1)
+        self.logger.debug(f"JOB DESCRIPTION: {job_desc}")
         job_status = job_desc["status"]
 
         # set log stream name if not none
         log_details = {"status": job_status, "jobId": job.external_jobid}
+        self.logger.debug(f"LOG DETAILS: {log_details}")
 
         if "container" in job_desc and "logStreamName" in job_desc["container"]:
             log_stream_name = job_desc["container"]["logStreamName"]
