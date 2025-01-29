@@ -6,8 +6,8 @@ class TestWorkflowsMocked(TestWorkflowsBase):
     __test__ = True
 
     @patch(
-            "snakemake_executor_plugin_aws_batch.Executor._get_job_status",
-            return_value=(0, "SUCCEEDED"),
+        "snakemake_executor_plugin_aws_batch.Executor._get_job_status",
+        return_value=(0, "SUCCEEDED"),
     )
     @patch(
         "snakemake.dag.DAG.check_and_touch_output",
