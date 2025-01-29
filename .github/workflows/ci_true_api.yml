@@ -38,7 +38,7 @@ jobs:
         uses: aws-actions/configure-aws-credentials@v4
         with:
           aws-region: "${{ secrets.SNAKEMAKE_AWS_BATCH_REGION }}"
-          role-to-assume: "{{ secrets.GH_AWS_ROLE_ARN }}"
+          role-to-assume: "${{ secrets.GH_AWS_ROLE_ARN }}"
           role-session-name: "GitHubActions"
 
       - name: Run pytest
