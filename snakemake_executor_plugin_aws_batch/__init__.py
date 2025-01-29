@@ -147,7 +147,7 @@ class Executor(RemoteExecutor):
             }
             self.logger.debug(f"AWS Batch job submitted: {log_info}")
         except Exception as e:
-            raise WorkflowError(e)
+            raise WorkflowError(f"Failed to submit AWS Batch job: {e}") from e
 
         self.report_job_submission(
             SubmittedJobInfo(
