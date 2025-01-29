@@ -111,11 +111,6 @@ class BatchJobBuilder:
 
         try:
             submitted = self.batch_client.submit_job(**job_params)
-            self.logger.debug(
-                "AWS Batch job submitted with queue {}, jobId {} and tags {}".format(
-                    self.settings.job_queue, submitted["jobId"], self.settings.tags
-                )
-            )
             return submitted
         except Exception as e:
             raise WorkflowError(f"Failed to submit job: {e}") from e

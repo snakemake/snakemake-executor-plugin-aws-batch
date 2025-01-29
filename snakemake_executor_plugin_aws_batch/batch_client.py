@@ -32,7 +32,7 @@ class BatchClient:
         """
         Register a job definition in AWS Batch.
 
-        :param kwargs: The keyword arguments to pass to the register_job_definition method.
+        :param kwargs: The keyword arguments to pass to register_job_definition method.
         :return: The response from the register_job_definition method.
         """
         return self.client.register_job_definition(**kwargs)
