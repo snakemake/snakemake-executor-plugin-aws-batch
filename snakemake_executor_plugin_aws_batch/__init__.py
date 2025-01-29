@@ -115,7 +115,10 @@ class Executor(RemoteExecutor):
         self.settings = self.workflow.executor_settings
         self.logger.debug(f"ExecutorSettings: {pformat(self.settings, indent=2)}")
 
-        self.batch_client = BatchClient(region_name=self.settings.region)
+        try:
+            self.batch_client = BatchClient(region_name=self.settings.region)
+        except Exception as e:
+            raise WorkflowError(f"Failed to initialize AWS Batch client: {e}") from e
 
     def run_job(self, job: JobExecutorInterface):
         # Implement here how to run a job.
