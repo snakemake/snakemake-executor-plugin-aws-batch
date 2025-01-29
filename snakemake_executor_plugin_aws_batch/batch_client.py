@@ -1,40 +1,41 @@
 import boto3
 
+BATCH_SERVICE_NAME = "batch"
 
-class AWSClient:
-    def __init__(self, service_name, region_name=None):
+
+class BatchClient:
+    def __init__(self, region_name=None):
         """
         Initialize an AWS client for a specific service using default credentials.
 
-        :param service_name: The name of the AWS service (e.g., 's3', 'ec2', 'dynamodb')
         :param region_name: The region name to use for the client (optional).
         """
-        self.service_name = service_name
+        self.service_name = BATCH_SERVICE_NAME
         self.region_name = region_name
-        self.client = self.initialize_client()
+        self.client = self.initialize_batch_client()
 
-    def initialize_client(self):
+    def initialize_batch_client(self):
         """
-        Create an AWS client using boto3 with the default credentials.
+        Create an AWS Batch Client using boto3 with the default credentials.
 
         :return: The boto3 client for the specified service.
         """
-        if self.region_name:
-            client = boto3.client(self.service_name, region_name=self.region_name)
-        else:
-            client = boto3.client(self.service_name)
-        return client
+        try:
+            if self.region_name:
+                return boto3.client(self.service_name, region_name=self.region_name)
+            return boto3.client(self.service_name)
 
+        except Exception as e:
+            raise Exception(f"Failed to initialize {self.service_name} client: {e}")
 
-# client class stub for AWS Batch
-class BatchClient(AWSClient):
-    def __init__(self, region_name=None):
+    def register_job_definition(self, **kwargs):
         """
-        Initialize an AWS Batch client using default credentials.
+        Register a job definition in AWS Batch.
 
-        :param region_name: The region name to use for the client (optional).
+        :param kwargs: The keyword arguments to pass to the register_job_definition method.
+        :return: The response from the register_job_definition method.
         """
-        super().__init__("batch", region_name)
+        return self.client.register_job_definition(**kwargs)
 
     def submit_job(self, **kwargs):
         """

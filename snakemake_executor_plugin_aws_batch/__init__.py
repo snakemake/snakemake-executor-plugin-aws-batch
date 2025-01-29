@@ -8,7 +8,6 @@ from pprint import pformat
 from typing import List, AsyncGenerator, Optional
 from snakemake_executor_plugin_aws_batch.batch_client import BatchClient
 from snakemake_executor_plugin_aws_batch.batch_job_builder import BatchJobBuilder
-from snakemake_executor_plugin_aws_batch.batch_descriptor import BatchJobDescriber
 from snakemake_interface_executor_plugins.executors.base import SubmittedJobInfo
 from snakemake_interface_executor_plugins.executors.remote import RemoteExecutor
 from snakemake_interface_executor_plugins.settings import (
@@ -120,7 +119,6 @@ class Executor(RemoteExecutor):
 
         # keep track of job definitions
         self.created_job_defs = list()
-        self._describer = BatchJobDescriber()
         self.batch_client = BatchClient(region_name=self.settings.region)
 
     def run_job(self, job: JobExecutorInterface):
@@ -197,75 +195,40 @@ class Executor(RemoteExecutor):
                     yield job
 
     def _get_job_status(self, job: SubmittedJobInfo) -> tuple[int, Optional[str]]:
-        """poll for Batch job success or failure
-
-        returns exits code and failure information if exit code is not 0
         """
-        known_status_list = [
-            "SUBMITTED",
-            "PENDING",
-            "RUNNABLE",
-            "STARTING",
-            "RUNNING",
-            "SUCCEEDED",
-            "FAILED",
-        ]
-        exit_code = None
-        log_stream_name = None
-        job_desc = self._describer.describe(self.batch_client, job.external_jobid, 1)
-        job_status = job_desc["status"]
+        Poll for Batch job status and return exit code and message if job is complete.
 
-        # set log stream name if not none
-        log_details = {"status": job_status, "jobId": job.external_jobid}
+        Returns:
+            tuple: (exit_code, failure_message)
+        """
+        try:
+            response = self.batch_client.describe_jobs(jobs=[job.external_jobid])
+            jobs = response.get("jobs", [])
 
-        if "container" in job_desc and "logStreamName" in job_desc["container"]:
-            log_stream_name = job_desc["container"]["logStreamName"]
+            if not jobs:
+                return None, f"No job found with ID {job.external_jobid}"
 
-        if log_stream_name:
-            log_details["logStreamName"] = log_stream_name
+            job_info: dict = jobs[0]
+            job_status = job_info.get("status", "UNKNOWN")
+            job.aux["job_definition_arn"] = job_info.get("jobDefinition", None)
+            exit_code = job_info.get("container", {}).get("exitCode", None)
 
-        if job_status not in known_status_list:
-            self.logger.info(f"unknown job status {job_status} from AWS Batch")
-            self.logger.debug("log details: {log_details} with status: {job_status}")
-
-        failure_info = None
-        if job_status == "SUCCEEDED":
-            return 0, failure_info
-
-        elif job_status == "FAILED":
-            reason = job_desc.get("container", {}).get("reason", None)
-            status_reason = job_desc.get("statusReason", None)
-            failure_info = {"jobId": job.external_jobid}
-
-            if reason:
-                failure_info["reason"] = reason
-
-            if status_reason:
-                failure_info["statusReason"] = status_reason
-
-            if log_stream_name:
-                failure_info["logStreamName"] = log_stream_name
-
-            if (
-                status_reason
-                and "Host EC2" in status_reason
-                and "terminated" in status_reason
-            ):
-                raise WorkflowError(
-                    "AWS Batch job interrupted (likely spot instance termination)"
-                    f"with error {failure_info}"
-                )
-
-            if "exitCode" not in job_desc.get("container", {}):
-                raise WorkflowError(
-                    f"AWS Batch job failed with error {failure_info['statusReason']}. "
-                    f"View log stream {failure_info['logStreamName']}",
-                )
-
-            exit_code = job_desc["container"]["exitCode"]
-            assert isinstance(exit_code, int) and exit_code != 0
-
-        return exit_code, failure_info
+            if job_status == "SUCCEEDED":
+                return 0, None
+            elif job_status == "FAILED":
+                reason = job_info.get("statusReason", "Unknown reason")
+                return exit_code or 1, reason
+            else:
+                log_info = {
+                    "job_name": job_info.get("jobName", "unknown"),
+                    "job_id": job.external_jobid,
+                    "status": job_status,
+                }
+                self.logger.debug(log_info)
+                return None, None
+        except Exception as e:
+            self.logger.error(f"Error getting job status: {e}")
+            return None, str(e)
 
     def _terminate_job(self, job: SubmittedJobInfo):
         """terminate job from submitted job info"""
@@ -284,9 +247,10 @@ class Executor(RemoteExecutor):
     def _deregister_job(self, job: SubmittedJobInfo):
         """deregister batch job definition"""
         try:
-            job_def_arn = job.aux["jobDefArn"]
-            self.logger.debug(f"de-registering Batch job definition {job_def_arn}")
-            self.batch_client.deregister_job_definition(jobDefinition=job_def_arn)
+            job_def_arn = job.aux.get("job_definition_arn")
+            if job_def_arn is not None:
+                self.logger.debug(f"de-registering Batch job definition {job_def_arn}")
+                self.batch_client.deregister_job_definition(jobDefinition=job_def_arn)
         except Exception as e:
             # AWS expires job definitions after 6mo
             # so failing to delete them isn't fatal

@@ -8,6 +8,7 @@ from snakemake_interface_executor_plugins.jobs import (
 from enum import Enum
 from snakemake_executor_plugin_aws_batch.batch_client import BatchClient
 
+
 SNAKEMAKE_COMMAND = "snakemake"
 
 
@@ -84,7 +85,7 @@ class BatchJobBuilder:
         timeout = {"attemptDurationSeconds": self.settings.task_timeout}
         tags = self.settings.tags if isinstance(self.settings.tags, dict) else dict()
         try:
-            job_def = self.batch_client.client.register_job_definition(
+            job_def = self.batch_client.register_job_definition(
                 jobDefinitionName=job_definition_name,
                 type=BATCH_JOB_DEFINITION_TYPE.CONTAINER.value,
                 containerProperties=container_properties,
