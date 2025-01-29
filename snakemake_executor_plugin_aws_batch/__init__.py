@@ -64,7 +64,7 @@ class ExecutorSettings(ExecutorSettingsBase):
         },
     )
     task_timeout: Optional[int] = field(
-        default=60,
+        default=300,
         metadata={
             "help": (
                 "Task timeout (seconds) will force AWS Batch to terminate "
@@ -110,15 +110,11 @@ class Executor(RemoteExecutor):
         # snakemake/snakemake:latest container image
         self.container_image = self.workflow.remote_execution_settings.container_image
 
-        # set the rate limit for status checks
         self.next_seconds_between_status_checks = 5
 
-        # access executor specific settings
         self.settings = self.workflow.executor_settings
         self.logger.debug(f"ExecutorSettings: {pformat(self.settings, indent=2)}")
 
-        # keep track of job definitions
-        self.created_job_defs = list()
         self.batch_client = BatchClient(region_name=self.settings.region)
 
     def run_job(self, job: JobExecutorInterface):
@@ -144,11 +140,12 @@ class Executor(RemoteExecutor):
                 batch_client=self.batch_client,
             )
             job_info = job_definition.submit()
-            self.logger.debug(
-                "AWS Batch job submitted with queue {}, jobId {} and tags {}".format(
-                    self.settings.job_queue, job_info["jobId"], self.settings.tags
-                )
-            )
+            log_info = {
+                "job_name:": job_info["jobName"],
+                "jobId": job_info["jobId"],
+                "job_queue": self.settings.job_queue,
+            }
+            self.logger.debug(f"AWS Batch job submitted: {log_info}")
         except Exception as e:
             raise WorkflowError(e)
 
@@ -210,6 +207,8 @@ class Executor(RemoteExecutor):
 
             job_info: dict = jobs[0]
             job_status = job_info.get("status", "UNKNOWN")
+
+            # push the job_definition_arn to the aux dict for use in cleanup
             job.aux["job_definition_arn"] = job_info.get("jobDefinition", None)
             exit_code = job_info.get("container", {}).get("exitCode", None)
 
