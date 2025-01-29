@@ -6,6 +6,10 @@ on:
 env:
   PYTHON_VERSION: "3.11"
 
+permissions:
+  id-token: write
+  contents: read
+
 jobs:
   testing-true-api:
     runs-on: ubuntu-latest
@@ -29,6 +33,13 @@ jobs:
 
       - name: Install Dependencies using Poetry
         run: poetry install
+
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-region: "${{ secrets.SNAKEMAKE_AWS_BATCH_REGION }}"
+          role-to-assume: "{{ secrets.GH_AWS_ROLE_ARN }}"
+          role-session-name: "GitHubActions"
 
       - name: Run pytest
         env:
