@@ -88,6 +88,22 @@ jobs:
           python-version: ${{ env.PYTHON_VERSION }}
           cache: poetry
 
+      - name: Set up Docker Compose
+        run: |
+          sudo apt-get update
+          sudo apt-get install docker-compose
+      - name: Start MinIO service
+        run: docker-compose -f tests/docker-compose.yml up -d
+
+      - name: Install MinIO Client CLI
+        run: |
+          curl -O https://dl.min.io/client/mc/release/linux-amd64/mc
+          chmod +x mc
+          sudo mv mc /usr/local/bin/
+      - name: Configure MinIO client
+        run: |
+          mc alias set minio http://localhost:9000 minio minio123
+
       - name: Install dependencies
         run: poetry install
 
