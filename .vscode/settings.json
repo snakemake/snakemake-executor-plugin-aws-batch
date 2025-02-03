@@ -1,0 +1,9 @@
+{
+    "black-formatter.interpreter": [
+        "./.venv/bin/python"
+    ],
+    "flake8.interpreter": [
+        "./.venv/bin/python"
+    ],
+    "files.saveConflictResolution": "overwriteFileOnDisk"
+}

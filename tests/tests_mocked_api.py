@@ -1,12 +1,14 @@
-from unittest.mock import AsyncMock, MagicMock, patch  # noqa
+from unittest.mock import AsyncMock, patch  # noqa
 from tests import TestWorkflowsBase
 
 
 class TestWorkflowsMocked(TestWorkflowsBase):
     __test__ = True
 
-    @patch("boto3.client")
-    # TODO: patch run_job internals
+    @patch(
+        "snakemake_executor_plugin_aws_batch.Executor._get_job_status",
+        return_value=(0, "SUCCEEDED"),
+    )
     @patch(
         "snakemake.dag.DAG.check_and_touch_output",
         new=AsyncMock(autospec=True),
