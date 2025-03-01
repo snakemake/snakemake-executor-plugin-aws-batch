@@ -2,30 +2,14 @@ import uuid
 import shlex
 from typing import List
 from snakemake.exceptions import WorkflowError
-from snakemake_interface_executor_plugins.jobs import (
-    JobExecutorInterface,
-)
-from enum import Enum
+from snakemake_interface_executor_plugins.jobs import JobExecutorInterface
 from snakemake_executor_plugin_aws_batch.batch_client import BatchClient
-
-
-SNAKEMAKE_COMMAND = "snakemake"
-
-
-class BATCH_JOB_DEFINITION_TYPE(Enum):
-    CONTAINER = "container"
-    MULTINODE = "multinode"
-
-
-class BATCH_JOB_PLATFORM_CAPABILITIES(Enum):
-    FARGATE = "FARGATE"
-    EC2 = "EC2"
-
-
-class BATCH_JOB_RESOURCE_REQUIREMENT_TYPE(Enum):
-    GPU = "GPU"
-    VCPU = "VCPU"
-    MEMORY = "MEMORY"
+from snakemake_executor_plugin_aws_batch.constant import (
+    VALID_RESOURCES_MAPPING,
+    BATCH_JOB_DEFINITION_TYPE,
+    BATCH_JOB_PLATFORM_CAPABILITIES,
+    BATCH_JOB_RESOURCE_REQUIREMENT_TYPE,
+)
 
 
 class BatchJobBuilder:
@@ -52,19 +36,42 @@ class BatchJobBuilder:
         """
         return [shlex.quote(part) for part in shlex.split(remote_command)]
 
+    def _validate_resources(self, vcpu: str, mem: str) -> tuple[str, str]:
+        """Validates vcpu and meme conform to Batch EC2 cpu/mem relationship 
+
+        https://docs.aws.amazon.com/batch/latest/APIReference/API_ResourceRequirement.html
+        """
+        vcpu = int(vcpu)
+        mem = int(mem)
+
+        if mem in VALID_RESOURCES_MAPPING:
+            if vcpu in VALID_RESOURCES_MAPPING[mem]:
+                return str(vcpu), str(mem)
+            else:
+                raise WorkflowError(f"Invalid vCPU value {vcpu} for memory {mem} MB")
+        else:
+            min_mem = min([m for m, v in VALID_RESOURCES_MAPPING.items() if vcpu in v])
+            self.logger.warning(
+                f"Memory value {mem} MB is invalid for vCPU {vcpu}."
+                f"Setting memory to minimum allowed value {min_mem} MB."
+            )
+            return str(vcpu), str(min_mem)
+
     def build_job_definition(self):
         job_uuid = str(uuid.uuid4())
         job_name = f"snakejob-{self.job.name}-{job_uuid}"
         job_definition_name = f"snakejob-def-{self.job.name}-{job_uuid}"
 
-        # TODO: validate resources
-        gpu = str(self.job.resources.get("_gpus", str(0)))
-        vcpu = str(self.job.resources.get("_cores", str(1)))
-        mem = str(self.job.resources.get("mem_mb", str(2048)))
+        # Validate and convert resources
+        gpu = str(self.job.resources.get("_gpus", 0))
+        vcpu = str(self.job.resources.get("_cores", 1))  # Default to 1 vCPU
+        mem = str(self.job.resources.get("mem_mb", 2048))  # Default to 2048 MiB
+
+        vcpu, mem = self._validate_resources(vcpu, mem)
 
         container_properties = {
             "image": self.container_image,
-            # command requires a list of strings ( docker CMD format )
+            # command requires a list of strings (docker CMD format)
             "command": self._make_container_command(self.job_command),
             "jobRoleArn": self.settings.job_role,
             "privileged": True,
@@ -73,7 +80,7 @@ class BatchJobBuilder:
                 {
                     "type": BATCH_JOB_RESOURCE_REQUIREMENT_TYPE.MEMORY.value,
                     "value": mem,
-                },  # noqa
+                },
             ],
         }
 
