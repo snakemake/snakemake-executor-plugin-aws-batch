@@ -77,17 +77,23 @@ class BatchJobBuilder:
             "jobRoleArn": self.settings.job_role,
             "privileged": True,
             "resourceRequirements": [
-                {"type": BATCH_JOB_RESOURCE_REQUIREMENT_TYPE.VCPU.value, "value": vcpu},
+                {
+                    "type": BATCH_JOB_RESOURCE_REQUIREMENT_TYPE.VCPU.value,
+                    "value": vcpu_str,
+                },
                 {
                     "type": BATCH_JOB_RESOURCE_REQUIREMENT_TYPE.MEMORY.value,
-                    "value": mem,
+                    "value": mem_str,
                 },
             ],
         }
 
-        if int(gpu) > 0:
+        if gpu > 0:
             container_properties["resourceRequirements"].append(
-                {"type": BATCH_JOB_RESOURCE_REQUIREMENT_TYPE.GPU.value, "value": gpu}
+                {
+                    "type": BATCH_JOB_RESOURCE_REQUIREMENT_TYPE.GPU.value,
+                    "value": gpu_str,
+                }
             )
 
         timeout = {"attemptDurationSeconds": self.settings.task_timeout}
