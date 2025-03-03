@@ -66,7 +66,7 @@ class BatchJobBuilder:
         gpu = max(0, int(self.job.resources.get("_gpus", 0)))
         vcpu = max(1, int(self.job.resources.get("_cores", 1)))  # Default to 1 vCPU
         mem = max(1, int(self.job.resources.get("mem_mb", 2048)))  # Default to 2048 MiB
-        
+
         vcpu_str, mem_str = self._validate_resources(str(vcpu), str(mem))
         gpu_str = str(gpu)
 
