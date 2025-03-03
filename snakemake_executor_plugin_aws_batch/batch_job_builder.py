@@ -37,7 +37,7 @@ class BatchJobBuilder:
         return [shlex.quote(part) for part in shlex.split(remote_command)]
 
     def _validate_resources(self, vcpu: str, mem: str) -> tuple[str, str]:
-        """Validates vcpu and meme conform to Batch EC2 cpu/mem relationship 
+        """Validates vcpu and meme conform to Batch EC2 cpu/mem relationship
 
         https://docs.aws.amazon.com/batch/latest/APIReference/API_ResourceRequirement.html
         """
