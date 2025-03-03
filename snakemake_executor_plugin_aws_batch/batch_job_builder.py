@@ -63,11 +63,12 @@ class BatchJobBuilder:
         job_definition_name = f"snakejob-def-{self.job.name}-{job_uuid}"
 
         # Validate and convert resources
-        gpu = str(self.job.resources.get("_gpus", 0))
-        vcpu = str(self.job.resources.get("_cores", 1))  # Default to 1 vCPU
-        mem = str(self.job.resources.get("mem_mb", 2048))  # Default to 2048 MiB
-
-        vcpu, mem = self._validate_resources(vcpu, mem)
+        gpu = max(0, int(self.job.resources.get("_gpus", 0)))
+        vcpu = max(1, int(self.job.resources.get("_cores", 1)))  # Default to 1 vCPU
+        mem = max(1, int(self.job.resources.get("mem_mb", 2048)))  # Default to 2048 MiB
+        
+        vcpu_str, mem_str = self._validate_resources(str(vcpu), str(mem))
+        gpu_str = str(gpu)
 
         container_properties = {
             "image": self.container_image,
