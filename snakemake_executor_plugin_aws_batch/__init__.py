@@ -28,7 +28,7 @@ from snakemake_interface_common.exceptions import WorkflowError
 # of None or anything else that makes sense in your case.
 @dataclass
 class ExecutorSettings(ExecutorSettingsBase):
-    region: Optional[int] = field(
+    region: Optional[str] = field(
         default=None,
         metadata={
             "help": "AWS Region",
