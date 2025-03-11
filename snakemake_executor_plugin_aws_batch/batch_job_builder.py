@@ -1,6 +1,6 @@
 import uuid
 from typing import List
-from snakemake.exceptions import WorkflowError
+from snakemake_interface_common.exceptions import WorkflowError
 from snakemake_interface_executor_plugins.jobs import JobExecutorInterface
 from snakemake_executor_plugin_aws_batch.batch_client import BatchClient
 from snakemake_executor_plugin_aws_batch.constant import (
