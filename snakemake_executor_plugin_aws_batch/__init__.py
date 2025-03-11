@@ -94,7 +94,7 @@ common_settings = CommonSettings(
     # whether environment variables shall be passed to jobs (if False, use
     # self.envvars() to obtain a dict of environment variables and their values
     # and pass them e.g. as secrets to the execution backend)
-    pass_envvar_declarations_to_cmd=True,
+    pass_envvar_declarations_to_cmd=False,
     # whether the default storage provider shall be deployed before the job is run on
     # the remote node. Usually set to True if the executor does not assume a shared fs
     auto_deploy_default_storage_provider=True,
@@ -137,6 +137,7 @@ class Executor(RemoteExecutor):
             job_definition = BatchJobBuilder(
                 logger=self.logger,
                 job=job,
+                envvars=self.envvars(),
                 container_image=self.container_image,
                 settings=self.settings,
                 job_command=remote_command,

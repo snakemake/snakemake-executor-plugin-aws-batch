@@ -17,6 +17,7 @@ class BatchJobBuilder:
         self,
         logger,
         job: JobExecutorInterface,
+        envvars: dict,
         container_image: str,
         settings,
         job_command: str,
@@ -24,6 +25,7 @@ class BatchJobBuilder:
     ):
         self.logger = logger
         self.job = job
+        self.envvars = envvars
         self.container_image = container_image
         self.settings = settings
         self.job_command = job_command
@@ -70,10 +72,15 @@ class BatchJobBuilder:
         vcpu_str, mem_str = self._validate_resources(str(vcpu), str(mem))
         gpu_str = str(gpu)
 
+        environment = []
+        if self.envvars:
+            environment = [{"name": k, "value": v} for k, v in self.envvars.items()]
+
         container_properties = {
             "image": self.container_image,
             # command requires a list of strings (docker CMD format)
             "command": self._make_container_command(self.job_command),
+            "environment": environment,
             "jobRoleArn": self.settings.job_role,
             "privileged": True,
             "resourceRequirements": [
