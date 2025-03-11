@@ -94,7 +94,7 @@ common_settings = CommonSettings(
     # whether environment variables shall be passed to jobs (if False, use
     # self.envvars() to obtain a dict of environment variables and their values
     # and pass them e.g. as secrets to the execution backend)
-    pass_envvar_declarations_to_cmd=True,
+    pass_envvar_declarations_to_cmd=False,
     # whether the default storage provider shall be deployed before the job is run on
     # the remote node. Usually set to True if the executor does not assume a shared fs
     auto_deploy_default_storage_provider=True,
@@ -131,15 +131,14 @@ class Executor(RemoteExecutor):
         # If required, make sure to pass the job's id to the job_info object, as keyword
         # argument 'external_job_id'.
 
-        remote_command = f"/bin/bash -c {self.format_job_exec(job)}"
-
         try:
             job_definition = BatchJobBuilder(
                 logger=self.logger,
                 job=job,
+                envvars=self.envvars(),
                 container_image=self.container_image,
                 settings=self.settings,
-                job_command=remote_command,
+                job_command=self.format_job_exec(job),
                 batch_client=self.batch_client,
             )
             job_info = job_definition.submit()
