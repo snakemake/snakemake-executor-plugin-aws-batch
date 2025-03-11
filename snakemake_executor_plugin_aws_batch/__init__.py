@@ -131,8 +131,6 @@ class Executor(RemoteExecutor):
         # If required, make sure to pass the job's id to the job_info object, as keyword
         # argument 'external_job_id'.
 
-        remote_command = f"/bin/bash -c {self.format_job_exec(job)}"
-
         try:
             job_definition = BatchJobBuilder(
                 logger=self.logger,
@@ -140,7 +138,7 @@ class Executor(RemoteExecutor):
                 envvars=self.envvars(),
                 container_image=self.container_image,
                 settings=self.settings,
-                job_command=remote_command,
+                job_command=self.format_job_exec(job),
                 batch_client=self.batch_client,
             )
             job_info = job_definition.submit()
