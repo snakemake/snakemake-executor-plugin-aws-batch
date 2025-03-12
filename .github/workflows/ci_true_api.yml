@@ -43,6 +43,8 @@ jobs:
 
       - name: Run pytest
         env:
+          SNAKEMAKE_STORAGE_S3_REGION: "${{ secrets.SNAKEMAKE_STORAGE_S3_REGION }}"
+          SNAKEMAKE_AWS_BATCH_REGION: "${{ secrets.SNAKEMAKE_AWS_BATCH_REGION }}"
           SNAKEMAKE_AWS_BATCH_JOB_QUEUE: "${{ secrets.SNAKEMAKE_AWS_BATCH_JOB_QUEUE }}"
           SNAKEMAKE_AWS_BATCH_JOB_ROLE: "${{ secrets.SNAKEMAKE_AWS_BATCH_JOB_ROLE }}"
         run: 
