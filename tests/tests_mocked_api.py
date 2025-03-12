@@ -25,5 +25,7 @@ class TestWorkflowsMocked(TestWorkflowsBase):
         "snakemake.jobs.wait_for_files",
         new=AsyncMock(autospec=True),
     )
-    def run_workflow(self, test_name, tmp_path, deployment_method=frozenset(), *extra_args, **kwargs):
+    def run_workflow(
+        self, test_name, tmp_path, deployment_method=frozenset(), *extra_args, **kwargs
+    ):
         super().run_workflow(test_name, tmp_path, deployment_method=deployment_method)
