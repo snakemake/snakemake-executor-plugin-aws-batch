@@ -90,6 +90,13 @@ jobs:
 
       - name: Install dependencies
         run: poetry install
+      
+      - name: Setup minio
+        uses: comfuture/minio-action@v1
+        with:
+          access_key: minio
+          secret_key: minio123
+          port: 9000
 
       - name: Run pytest
         env:
