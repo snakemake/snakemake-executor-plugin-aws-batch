@@ -1,10 +1,14 @@
-from unittest.mock import AsyncMock, patch  # noqa
+from unittest.mock import AsyncMock, patch
 from tests import TestWorkflowsBase
 
 
 class TestWorkflowsMocked(TestWorkflowsBase):
     __test__ = True
 
+    @patch(
+        "snakemake_executor_plugin_aws_batch.batch_job_builder.BatchJobBuilder.submit",
+        return_value={"jobName": "job_id", "jobId": "job_id", "jobQueue": "job_queue"},
+    )
     @patch(
         "snakemake_executor_plugin_aws_batch.Executor._get_job_status",
         return_value=(0, "SUCCEEDED"),
@@ -18,10 +22,8 @@ class TestWorkflowsMocked(TestWorkflowsBase):
         new=AsyncMock(autospec=True, return_value=0),
     )
     @patch(
-        # mocking has to happen in the importing module, see
-        # http://www.gregreda.com/2021/06/28/mocking-imported-module-function-python
         "snakemake.jobs.wait_for_files",
         new=AsyncMock(autospec=True),
     )
-    def run_workflow(self, *args, **kwargs):
-        super().run_workflow(*args, **kwargs)
+    def run_workflow(self, test_name, tmp_path, deployment_method=frozenset(), *extra_args, **kwargs):
+        super().run_workflow(test_name, tmp_path, deployment_method=deployment_method)
