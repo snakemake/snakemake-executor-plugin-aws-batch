@@ -186,17 +186,15 @@ class Executor(RemoteExecutor):
             async with self.status_rate_limiter:
                 status_code, msg = self._get_job_status(job)
 
-                # cleanup job artifact on success and failure
-                if status_code is not None:
-                    self.cleanup_job_resources(job)
-
+            if status_code is not None:
                 if status_code == 0:
                     self.report_job_success(job)
-                elif status_code is not None:
+                else:
                     message = f"AWS Batch job failed. Code: {status_code}, Msg: {msg}."
                     self.report_job_error(job, msg=message)
-                else:
-                    yield job
+                self.cleanup_job_resources(job)
+            else:
+                yield job
 
     def _get_job_status(self, job: SubmittedJobInfo) -> tuple[int, Optional[str]]:
         """
