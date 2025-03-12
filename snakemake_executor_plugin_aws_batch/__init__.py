@@ -185,6 +185,11 @@ class Executor(RemoteExecutor):
         for job in active_jobs:
             async with self.status_rate_limiter:
                 status_code, msg = self._get_job_status(job)
+
+                # cleanup job artifact on success and failure
+                if status_code is not None:
+                    self.cleanup_job_resources(job)
+
                 if status_code == 0:
                     self.report_job_success(job)
                 elif status_code is not None:
@@ -260,6 +265,11 @@ class Executor(RemoteExecutor):
                 f"{job_def_arn} with error {e}"
             )
 
+    def cleanup_job_resources(self, job: SubmittedJobInfo):
+        """Terminate and deregister job resources"""
+        self._terminate_job(job)
+        self._deregister_job(job)
+
     def cancel_jobs(self, active_jobs: List[SubmittedJobInfo]):
         # Cancel all active jobs.
         # This method is called when Snakemake is interrupted.
@@ -268,5 +278,4 @@ class Executor(RemoteExecutor):
         self.logger.info("shutting down...")
         # cleanup jobs
         for j in active_jobs:
-            self._terminate_job(j)
-            self._deregister_job(j)
+            self.cleanup_job_resources(j)
