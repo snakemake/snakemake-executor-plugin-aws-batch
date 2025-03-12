@@ -1,5 +1,5 @@
-from tests import TestWorkflowsBase
+from tests import TestWorkflowsTrueStorageBase
 
 
-class TestWorkflowsTrueApi(TestWorkflowsBase):
+class TestWorkflowsTrueApi(TestWorkflowsTrueStorageBase):
     __test__ = True
