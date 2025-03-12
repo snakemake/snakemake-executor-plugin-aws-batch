@@ -118,6 +118,8 @@ resource "aws_batch_compute_environment" "sample" {
     max_vcpus = var.max_vcpus
     min_vcpus = var.min_vcpus
 
+    allocation_strategy = var.aws_batch_compute_resource_allocation_strategy
+
     placement_group = aws_placement_group.sample.name
 
     security_group_ids = [aws_security_group.sg01.id]
@@ -142,4 +144,10 @@ resource "aws_batch_job_queue" "snakequeue" {
     order               = 1
     compute_environment = aws_batch_compute_environment.sample.arn
   }
+
+  # placeholder for additional compute environment
+  # compute_environment_order {
+  #   order               = 2
+  #   compute_environment = aws_batch_compute_environment02.sample.arn
+  # }
 }
