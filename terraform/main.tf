@@ -151,3 +151,15 @@ resource "aws_batch_job_queue" "snakequeue" {
   #   compute_environment = aws_batch_compute_environment02.sample.arn
   # }
 }
+
+output "SNAKEMAKE_AWS_BATCH_REGION" {
+  value = var.aws_provider_region
+}
+
+output "SNAKEMAKE_AWS_BATCH_JOB_QUEUE" {
+  value = aws_batch_job_queue.snakequeue.arn
+}
+
+output "SNAKEMAKE_AWS_BATCH_JOB_ROLE" {
+  value = aws_iam_role.aws_batch_service_role.arn
+}
