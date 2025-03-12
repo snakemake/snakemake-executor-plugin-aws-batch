@@ -39,7 +39,6 @@ class TestWorkflowsTrueStorageBase(TestWorkflowsBase):
         from snakemake_storage_plugin_s3 import StorageProviderSettings
 
         self._storage_provider_settings = StorageProviderSettings(
-            region=os.getenv("SNAKEMAKE_STORAGE_S3_REGION"),
             access_key=os.getenv("SNAKEMAKE_STORAGE_S3_ACCESS_KEY"),
             secret_key=os.getenv("SNAKEMAKE_STORAGE_S3_SECRET_KEY"),
         )
