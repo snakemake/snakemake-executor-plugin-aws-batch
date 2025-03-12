@@ -68,8 +68,8 @@ variable "aws_batch_compute_environment_name" {
 variable "instance_types" {
   description = "The allowed instance types for the compute environment"
   type        = list(string)
-  default     = ["c4.xlarge"]
-  # , "c4.xlarge", "c4.2xlarge", "c4.4xlarge", "c4.8xlarge"]
+  default     = ["c5.xlarge"]
+  # , "c5.large", "c5.2xlarge", "c5.4xlarge", "c5.8xlarge"]
 }
 
 variable "max_vcpus" {
