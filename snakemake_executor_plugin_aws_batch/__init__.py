@@ -243,9 +243,8 @@ class Executor(RemoteExecutor):
                 reason="terminated by snakemake",
             )
         except Exception as e:
-            job_spec = job.aux["job_params"]
             self.logger.info(
-                f"failed to terminate Batch job definition: {job_spec} with error: {e}"
+                f"failed to terminate Batch job: {job.external_jobid} with error: {e}"
             )
 
     def _deregister_job(self, job: SubmittedJobInfo):
