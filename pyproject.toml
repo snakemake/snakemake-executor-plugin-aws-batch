@@ -9,18 +9,18 @@ documentation = "https://snakemake.github.io/snakemake-plugin-catalog/plugins/ex
 keywords = ["snakemake", "plugin", "executor", "aws-batch"]
 
 [tool.poetry.dependencies]
+boto3 = "^1.36.5"
 python = "^3.11"
+snakemake = "^8.30.0"
 snakemake-interface-common = "^1.17.4"
 snakemake-interface-executor-plugins = "^9.3.2"
-boto3 = "^1.36.5"
+snakemake-storage-plugin-s3 = "^0.3.1"
 
 [tool.poetry.group.dev.dependencies]
 black = "^23.11.0"
 flake8 = "^6.1.0"
 coverage = "^7.3.2"
 pytest = "^7.4.3"
-snakemake = "^8.20.1"
-snakemake-storage-plugin-s3 = "^0.3.1"
 
 [tool.coverage.run]
 omit = [".*", "*/site-packages/*", "Snakefile"]
