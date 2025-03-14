@@ -1,5 +1,18 @@
 # Changelog
 
+## [0.2.0](https://github.com/snakemake/snakemake-executor-plugin-aws-batch/compare/v0.1.0...v0.2.0) (2025-03-14)
+
+
+### Features
+
+* cleanup job definitions ([#20](https://github.com/snakemake/snakemake-executor-plugin-aws-batch/issues/20)) ([c1843ec](https://github.com/snakemake/snakemake-executor-plugin-aws-batch/commit/c1843ec5969d9c14ceae20db986466c8b5571452))
+
+
+### Miscellaneous Chores
+
+* release 0.2.0 ([af1c0bc](https://github.com/snakemake/snakemake-executor-plugin-aws-batch/commit/af1c0bc619cfa4da7983b6e03a2a36405d28b7dd))
+* release 0.2.0 ([d18ea37](https://github.com/snakemake/snakemake-executor-plugin-aws-batch/commit/d18ea3743340a3cb6a940d9b5bbb0e4dc3274b58))
+
 ## 0.1.0 (2025-03-03)
 
 
