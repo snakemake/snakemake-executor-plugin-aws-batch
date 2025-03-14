@@ -1,6 +1,6 @@
 [tool.poetry]
 name = "snakemake-executor-plugin-aws-batch"
-version = "0.1.0"
+version = "0.2.0"
 description = ""
 authors = ["jakevc <jake.vancampen7@gmail.com>", "W. Lee Pang <wleepang>"]
 readme = "README.md"
