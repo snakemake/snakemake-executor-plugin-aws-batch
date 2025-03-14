@@ -1,7 +1,8 @@
 [tool.poetry]
 name = "snakemake-executor-plugin-aws-batch"
 version = "0.2.0"
-description = ""
+description = "Snakemake executor plugin for AWS Batch"
+license = "MIT"
 authors = ["jakevc <jake.vancampen7@gmail.com>", "W. Lee Pang <wleepang>"]
 readme = "README.md"
 repository = "https://github.com/snakemake/snakemake-executor-plugin-aws-batch"
@@ -11,7 +12,6 @@ keywords = ["snakemake", "plugin", "executor", "aws-batch"]
 [tool.poetry.dependencies]
 boto3 = "^1.36.5"
 python = "^3.11"
-snakemake = "^8.30.0"
 snakemake-interface-common = "^1.17.4"
 snakemake-interface-executor-plugins = "^9.3.2"
 snakemake-storage-plugin-s3 = "^0.3.1"
