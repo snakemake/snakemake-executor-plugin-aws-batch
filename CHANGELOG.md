@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.2.2](https://github.com/snakemake/snakemake-executor-plugin-aws-batch/compare/v0.2.1...v0.2.2) (2025-03-19)
+
+
+### Documentation
+
+* doc link in README.md ([#27](https://github.com/snakemake/snakemake-executor-plugin-aws-batch/issues/27)) ([2525ca0](https://github.com/snakemake/snakemake-executor-plugin-aws-batch/commit/2525ca0ce5266fecc1fecd9f1750b2f8f397e560))
+
 ## [0.2.1](https://github.com/snakemake/snakemake-executor-plugin-aws-batch/compare/v0.2.0...v0.2.1) (2025-03-14)
 
 

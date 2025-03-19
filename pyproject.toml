@@ -1,6 +1,6 @@
 [tool.poetry]
 name = "snakemake-executor-plugin-aws-batch"
-version = "0.2.1"
+version = "0.2.2"
 description = "Snakemake executor plugin for AWS Batch"
 license = "MIT"
 authors = ["jakevc <jake.vancampen7@gmail.com>", "W. Lee Pang <wleepang>"]
