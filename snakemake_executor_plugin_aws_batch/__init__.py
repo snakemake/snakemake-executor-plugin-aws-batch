@@ -228,7 +228,7 @@ class Executor(RemoteExecutor):
                     "job_id": job.external_jobid,
                     "status": job_status,
                 }
-                self.logger.debug(log_info)
+                self.logger.debug(str(log_info))
                 return None, None
         except Exception as e:
             self.logger.error(f"Error getting job status: {e}")
