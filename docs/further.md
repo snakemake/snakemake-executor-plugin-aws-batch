@@ -28,6 +28,24 @@ SNAKEMAKE_AWS_BATCH_REGION
 SNAKEMAKE_AWS_BATCH_JOB_QUEUE
 SNAKEMAKE_AWS_BATCH_JOB_ROLE
 
+# Rule-Specific Container Images
+
+By default, all jobs use the global container image specified via `--container-image`. However, you can specify a different container image for individual rules using the `aws_batch_container_image` resource parameter:
+
+```python
+rule my_rule:
+    input:
+        "input.txt"
+    output:
+        "output.txt"
+    resources:
+        aws_batch_container_image="my-custom-image:tag"
+    shell:
+        "process_data.sh {input} {output}"
+```
+
+This allows you to use different containers with specialized tools for different rules within the same workflow, rather than requiring all tools to be present in a single container.
+
 # Example
 
 ## Create environment
