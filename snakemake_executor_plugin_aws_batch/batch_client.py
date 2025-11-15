@@ -72,3 +72,21 @@ class BatchClient:
         :return: The response from the terminate_job method.
         """
         return self.client.terminate_job(**kwargs)
+
+    def describe_job_queues(self, **kwargs):
+        """
+        Describe job queues in AWS Batch.
+
+        :param kwargs: The keyword arguments to pass to the describe_job_queues method.
+        :return: The response from the describe_job_queues method.
+        """
+        return self.client.describe_job_queues(**kwargs)
+
+    def describe_compute_environments(self, **kwargs):
+        """
+        Describe compute environments in AWS Batch.
+
+        :param kwargs: The keyword arguments to pass to the describe_compute_environments method.
+        :return: The response from the describe_compute_environments method.
+        """
+        return self.client.describe_compute_environments(**kwargs)
