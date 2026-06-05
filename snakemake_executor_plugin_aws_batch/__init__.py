@@ -8,6 +8,7 @@ from pprint import pformat
 from typing import List, AsyncGenerator, Optional
 from snakemake_executor_plugin_aws_batch.batch_client import BatchClient
 from snakemake_executor_plugin_aws_batch.batch_job_builder import BatchJobBuilder
+from snakemake_executor_plugin_aws_batch import remote_state
 from snakemake_interface_executor_plugins.executors.base import SubmittedJobInfo
 from snakemake_interface_executor_plugins.executors.remote import RemoteExecutor
 from snakemake_interface_executor_plugins.settings import (
@@ -264,6 +265,11 @@ class Executor(RemoteExecutor):
             job.aux["job_definition_arn"] = job_info.get("jobDefinition", None)
             exit_code = job_info.get("container", {}).get("exitCode", None)
 
+            # Surface the rich Batch state (queue/run/terminal, timestamps, ids) to
+            # any log consumer via a structured record. Emit once per phase
+            # transition so the event stream isn't spammed on every poll.
+            self._emit_remote_state(job, job_info)
+
             if job_status == "SUCCEEDED":
                 return 0, None
             elif job_status == "FAILED":
@@ -280,6 +286,41 @@ class Executor(RemoteExecutor):
         except Exception as e:
             self.logger.error(f"Error getting job status: {e}")
             return None, str(e)
+
+    def _emit_remote_state(self, job: SubmittedJobInfo, job_info: dict) -> None:
+        """Emit a remote-state event when the job's phase changes.
+
+        De-duplicated per job: the normalized phase last emitted is stashed in
+        ``job.aux`` so each queue->run->terminal transition is reported once even
+        though ``check_active_jobs`` polls repeatedly. Best-effort: any failure
+        here must never disrupt job monitoring.
+        """
+        try:
+            if job.aux is None:
+                return
+            phase = remote_state.phase_for_status(job_info.get("status"))
+            if phase is None or job.aux.get("_remote_state_phase") == phase:
+                return
+            snakemake_job = getattr(job, "job", None)
+            snakemake_jobid = getattr(snakemake_job, "jobid", None)
+            region = getattr(self.settings, "region", None)
+            payload = remote_state.build_payload(
+                snakemake_jobid=snakemake_jobid,
+                external_jobid=job.external_jobid,
+                job_info=job_info,
+                region=region,
+                attempt=getattr(snakemake_job, "attempt", None),
+            )
+            if payload is not None:
+                # Record the phase BEFORE emitting so a best-effort emit failure
+                # does not re-attempt on every subsequent poll of this job.
+                job.aux["_remote_state_phase"] = phase
+                remote_state.emit(self.logger, payload)
+        except (
+            Exception
+        ) as e:  # pragma: no cover - defensive; monitoring must not break
+            jobid = getattr(getattr(job, "job", None), "jobid", None)
+            self.logger.debug(f"remote-state emit skipped for job {jobid}: {e}")
 
     def _terminate_job(self, job: SubmittedJobInfo):
         """terminate job from submitted job info"""
