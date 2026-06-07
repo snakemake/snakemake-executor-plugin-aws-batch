@@ -1,5 +1,5 @@
 import uuid
-from typing import List
+from typing import Any, List
 from snakemake_interface_common.exceptions import WorkflowError
 from snakemake_interface_executor_plugins.jobs import JobExecutorInterface
 from snakemake_executor_plugin_aws_batch.batch_client import BatchClient
@@ -102,17 +102,28 @@ class BatchJobBuilder:
                 }
             )
 
-        timeout = {"attemptDurationSeconds": self.settings.task_timeout}
-        tags = self.settings.tags if isinstance(self.settings.tags, dict) else dict()
-        try:
-            job_def = self.batch_client.register_job_definition(
-                jobDefinitionName=job_definition_name,
-                type=BATCH_JOB_DEFINITION_TYPE.CONTAINER.value,
-                containerProperties=container_properties,
-                timeout=timeout,
-                tags=tags,
-                platformCapabilities=[BATCH_JOB_PLATFORM_CAPABILITIES.EC2.value],
+        # Only include `timeout` when task_timeout is explicitly set — omitting the
+        # key means AWS Batch applies no timeout, which is the correct default for
+        # long-running bioinformatics workloads. When set, enforce the AWS minimum
+        # of 60 s locally so the error is clear rather than a Batch API rejection.
+        task_timeout = self.settings.task_timeout
+        if task_timeout is not None and task_timeout < 60:
+            raise WorkflowError(
+                f"--aws-batch-task-timeout must be at least 60 seconds (AWS minimum), "
+                f"got {task_timeout}."
             )
+        tags = self.settings.tags if isinstance(self.settings.tags, dict) else dict()
+        register_kwargs: dict[str, Any] = dict(
+            jobDefinitionName=job_definition_name,
+            type=BATCH_JOB_DEFINITION_TYPE.CONTAINER.value,
+            containerProperties=container_properties,
+            tags=tags,
+            platformCapabilities=[BATCH_JOB_PLATFORM_CAPABILITIES.EC2.value],
+        )
+        if task_timeout is not None:
+            register_kwargs["timeout"] = {"attemptDurationSeconds": task_timeout}
+        try:
+            job_def = self.batch_client.register_job_definition(**register_kwargs)
             self.created_job_defs.append(job_def)
             return job_def, job_name
         except Exception as e:

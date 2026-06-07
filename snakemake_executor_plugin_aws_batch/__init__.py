@@ -64,12 +64,15 @@ class ExecutorSettings(ExecutorSettingsBase):
         },
     )
     task_timeout: Optional[int] = field(
-        default=300,
+        default=None,
         metadata={
             "help": (
-                "Task timeout (seconds) will force AWS Batch to terminate "
-                "a Batch task if it fails to finish within the timeout, minimum 60"
-            )
+                "Task timeout in seconds: AWS Batch terminates a job that does not "
+                "finish within this limit. Jobs have no timeout unless this is set. "
+                "When set, the value must be at least 60 (the AWS minimum)."
+            ),
+            "env_var": False,
+            "required": False,
         },
     )
 
