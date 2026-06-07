@@ -102,7 +102,7 @@ jobs:
         env:
           SNAKEMAKE_AWS_BATCH_JOB_QUEUE: "${{ secrets.SNAKEMAKE_AWS_BATCH_JOB_QUEUE }}"
           SNAKEMAKE_AWS_BATCH_JOB_ROLE: "${{ secrets.SNAKEMAKE_AWS_BATCH_JOB_ROLE }}"
-        run: poetry run coverage run -m pytest tests/tests_mocked_api.py -v
+        run: poetry run coverage run -m pytest tests/tests_mocked_api.py tests/test_batch_job_builder.py -v
 
       - name: Run Coverage
         run: poetry run coverage report -m
