@@ -265,16 +265,32 @@ class BatchJobBuilder:
                 "sharedMemorySize": shm_size,
             }
 
-        # Only include `timeout` when task_timeout is explicitly set — omitting the
+        # Only include `timeout` when a timeout is explicitly set — omitting the
         # key means AWS Batch applies no timeout, which is the correct default for
-        # long-running bioinformatics workloads. When set, enforce the AWS minimum
-        # of 60 s locally so the error is clear rather than a Batch API rejection.
-        task_timeout = self.settings.task_timeout
-        if task_timeout is not None and task_timeout < 60:
-            raise WorkflowError(
-                f"--aws-batch-task-timeout must be at least 60 seconds (AWS minimum), "
-                f"got {task_timeout}."
-            )
+        # long-running bioinformatics workloads. The per-rule aws_batch_task_timeout
+        # resource takes precedence over the workflow-level task_timeout setting.
+        # When set, enforce the AWS minimum of 60 s locally so the error is clear
+        # rather than a Batch API rejection.
+        rule_timeout = self.job.resources.get("aws_batch_task_timeout")
+        if rule_timeout is not None:
+            task_timeout = rule_timeout
+            timeout_source = "aws_batch_task_timeout resource"
+        else:
+            task_timeout = self.settings.task_timeout
+            timeout_source = "--aws-batch-task-timeout"
+        if task_timeout is not None:
+            try:
+                task_timeout = int(task_timeout)
+            except (TypeError, ValueError) as e:
+                raise WorkflowError(
+                    f"Invalid {timeout_source} value {task_timeout!r}: "
+                    "must be an integer number of seconds (minimum 60)."
+                ) from e
+            if task_timeout < 60:
+                raise WorkflowError(
+                    f"{timeout_source} must be at least 60 seconds (AWS minimum), "
+                    f"got {task_timeout}."
+                )
         # Use the same validated, env-merged tag set as submit_job so the job
         # definition carries identical tags (each job registers its own
         # definition, so per-run cost-tracking tags apply to both).

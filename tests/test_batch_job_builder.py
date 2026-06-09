@@ -683,3 +683,112 @@ class TestTaskTimeout:
         with pytest.raises(WorkflowError, match="60"):
             builder.build_job_definition()
         builder.batch_client.register_job_definition.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# Tests for build_job_definition — per-rule aws_batch_task_timeout resource
+# ---------------------------------------------------------------------------
+
+
+def _make_builder_with_rule_timeout(
+    setting_timeout=None, resource_timeout=None
+) -> BatchJobBuilder:
+    """Return a BatchJobBuilder for per-rule timeout tests.
+
+    setting_timeout  — value for settings.task_timeout (None = no global timeout).
+    resource_timeout — value for job.resources["aws_batch_task_timeout"]
+                       (None = key absent from resources dict).
+    """
+    resources: dict = {"_cores": 1, "mem_mb": 1024}
+    if resource_timeout is not None:
+        resources["aws_batch_task_timeout"] = resource_timeout
+
+    settings = SimpleNamespace(
+        job_queue="test-queue",
+        job_role="arn:aws:iam::123456789:role/test-role",
+        tags=None,
+        task_timeout=setting_timeout,
+    )
+    batch_client = MagicMock()
+    batch_client.describe_job_queues.return_value = {"jobQueues": []}
+    batch_client.register_job_definition.return_value = _fake_job_def()
+
+    job = MagicMock()
+    job.name = "test_rule"
+    job.threads = 1
+    job.resources = resources
+
+    return BatchJobBuilder(
+        logger=MagicMock(),
+        job=job,
+        envvars={},
+        container_image="test-image:latest",
+        settings=settings,
+        job_command="snakemake ...",
+        batch_client=batch_client,
+    )
+
+
+class TestPerRuleTaskTimeout:
+    def test_resource_overrides_setting(self):
+        """aws_batch_task_timeout resource takes precedence over the global setting."""
+        builder = _make_builder_with_rule_timeout(
+            setting_timeout=300, resource_timeout=14400
+        )
+        builder.build_job_definition()
+        call_kwargs = builder.batch_client.register_job_definition.call_args.kwargs
+        assert call_kwargs["timeout"] == {"attemptDurationSeconds": 14400}
+
+    def test_resource_alone_no_setting(self):
+        """Per-rule resource works when settings.task_timeout is None."""
+        builder = _make_builder_with_rule_timeout(
+            setting_timeout=None, resource_timeout=7200
+        )
+        builder.build_job_definition()
+        call_kwargs = builder.batch_client.register_job_definition.call_args.kwargs
+        assert call_kwargs["timeout"] == {"attemptDurationSeconds": 7200}
+
+    def test_fallback_to_setting_when_resource_absent(self):
+        """When resource is absent, the global setting is used."""
+        builder = _make_builder_with_rule_timeout(
+            setting_timeout=3600, resource_timeout=None
+        )
+        builder.build_job_definition()
+        call_kwargs = builder.batch_client.register_job_definition.call_args.kwargs
+        assert call_kwargs["timeout"] == {"attemptDurationSeconds": 3600}
+
+    def test_both_absent_omits_timeout(self):
+        """When neither resource nor setting is set, timeout is omitted."""
+        builder = _make_builder_with_rule_timeout(
+            setting_timeout=None, resource_timeout=None
+        )
+        builder.build_job_definition()
+        call_kwargs = builder.batch_client.register_job_definition.call_args.kwargs
+        assert "timeout" not in call_kwargs
+
+    def test_resource_below_60_raises_workflow_error(self):
+        """Per-rule timeout < 60 must raise WorkflowError."""
+        builder = _make_builder_with_rule_timeout(
+            setting_timeout=None, resource_timeout=30
+        )
+        with pytest.raises(WorkflowError, match="60"):
+            builder.build_job_definition()
+        builder.batch_client.register_job_definition.assert_not_called()
+
+    def test_non_numeric_resource_raises_workflow_error(self):
+        """Non-numeric aws_batch_task_timeout (e.g. '4h') must raise WorkflowError."""
+        builder = _make_builder_with_rule_timeout(
+            setting_timeout=None, resource_timeout="4h"
+        )
+        with pytest.raises(WorkflowError, match="aws_batch_task_timeout"):
+            builder.build_job_definition()
+        builder.batch_client.register_job_definition.assert_not_called()
+
+    def test_resource_exactly_60_passes(self):
+        """Exactly 60 seconds via resource is the AWS minimum and must not raise."""
+        builder = _make_builder_with_rule_timeout(
+            setting_timeout=None, resource_timeout=60
+        )
+        builder.build_job_definition()
+        call_kwargs = builder.batch_client.register_job_definition.call_args.kwargs
+        assert call_kwargs["timeout"] == {"attemptDurationSeconds": 60}
