@@ -93,6 +93,24 @@ rule align:
 
 Platform detection and job submission both use the resolved per-rule queue.
 
+# Task Timeout
+
+By default jobs have no timeout. Set `--aws-batch-task-timeout` to impose a
+workflow-wide limit (in seconds; minimum 60). A rule can override this with the
+`aws_batch_task_timeout` resource, e.g. to give a long-running alignment step
+more time while keeping a tight limit on bookkeeping rules:
+
+```python
+rule align:
+    resources:
+        aws_batch_task_timeout=14400  # 4 h
+    ...
+```
+
+The per-rule resource takes precedence over `--aws-batch-task-timeout`. When
+neither is set, AWS Batch imposes no timeout. When set, the value must be at
+least 60 seconds (the AWS minimum).
+
 # Shared Memory (`/dev/shm`)
 
 On EC2/ECS containers `/dev/shm` defaults to 64 MB, which is too small for
