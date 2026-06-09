@@ -75,6 +75,20 @@ class ExecutorSettings(ExecutorSettingsBase):
             "required": False,
         },
     )
+    scheduling_priority: Optional[int] = field(
+        default=None,
+        metadata={
+            "help": (
+                "Default scheduling priority applied to every submitted job "
+                "(schedulingPriorityOverride). Only meaningful on fair-share job "
+                "queues, i.e. queues with a scheduling policy attached; ignored "
+                "otherwise. Per-rule overrides via the "
+                "aws_batch_scheduling_priority resource take precedence."
+            ),
+            "env_var": False,
+            "required": False,
+        },
+    )
 
 
 # Required:

@@ -792,3 +792,188 @@ class TestPerRuleTaskTimeout:
         builder.build_job_definition()
         call_kwargs = builder.batch_client.register_job_definition.call_args.kwargs
         assert call_kwargs["timeout"] == {"attemptDurationSeconds": 60}
+
+
+# ---------------------------------------------------------------------------
+# Tests for submit() — scheduling priority
+# ---------------------------------------------------------------------------
+
+
+def _make_builder_with_priority(setting_priority=None, resource_priority=None):
+    """Return a BatchJobBuilder configured for scheduling-priority tests.
+
+    setting_priority  — value for settings.scheduling_priority (None = unset).
+    resource_priority — value for job.resources["aws_batch_scheduling_priority"]
+                        (None = key absent from resources dict).
+    """
+    resources = {"_cores": 1, "mem_mb": 1024}
+    if resource_priority is not None:
+        resources["aws_batch_scheduling_priority"] = resource_priority
+
+    settings = SimpleNamespace(
+        job_queue="test-queue",
+        job_role="arn:aws:iam::123456789:role/test-role",
+        tags=None,
+        scheduling_priority=setting_priority,
+    )
+
+    batch_client = MagicMock()
+    batch_client.describe_job_queues.return_value = {"jobQueues": []}
+
+    job = MagicMock()
+    job.name = "test_rule"
+    job.threads = 1
+    job.resources = resources
+
+    return BatchJobBuilder(
+        logger=MagicMock(),
+        job=job,
+        envvars={},
+        container_image="test-image:latest",
+        settings=settings,
+        job_command="snakemake ...",
+        batch_client=batch_client,
+    )
+
+
+def _run_submit_priority(builder):
+    """Patch build_job_definition and call submit(); return submit_job call_args."""
+    builder.batch_client.submit_job.return_value = {
+        "jobName": "snakejob-test",
+        "jobId": "abc-123",
+        "jobQueue": "test-queue",
+    }
+    with patch.object(
+        builder,
+        "build_job_definition",
+        return_value=(_fake_job_def(), "snakejob-test"),
+    ):
+        builder.submit()
+    return builder.batch_client.submit_job.call_args
+
+
+class TestSubmitSchedulingPriority:
+    def test_unset_omits_kwarg(self):
+        """When neither setting nor resource is set, schedulingPriorityOverride
+        must be absent from the submit_job call."""
+        builder = _make_builder_with_priority(
+            setting_priority=None, resource_priority=None
+        )
+        call_args = _run_submit_priority(builder)
+        assert "schedulingPriorityOverride" not in call_args.kwargs
+
+    def test_setting_only_present_with_value(self):
+        """A workflow-level setting is forwarded when no per-rule override exists."""
+        builder = _make_builder_with_priority(
+            setting_priority=50, resource_priority=None
+        )
+        call_args = _run_submit_priority(builder)
+        assert call_args.kwargs["schedulingPriorityOverride"] == 50
+
+    def test_resource_overrides_setting(self):
+        """Per-rule aws_batch_scheduling_priority takes precedence over the setting."""
+        builder = _make_builder_with_priority(
+            setting_priority=10, resource_priority=100
+        )
+        call_args = _run_submit_priority(builder)
+        assert call_args.kwargs["schedulingPriorityOverride"] == 100
+
+    def test_resource_alone_works(self):
+        """Per-rule resource without any workflow-level setting is applied."""
+        builder = _make_builder_with_priority(
+            setting_priority=None, resource_priority=75
+        )
+        call_args = _run_submit_priority(builder)
+        assert call_args.kwargs["schedulingPriorityOverride"] == 75
+
+    def test_non_numeric_resource_raises_workflow_error(self):
+        """A non-numeric aws_batch_scheduling_priority resource raises WorkflowError
+        and does not call submit_job."""
+        builder = _make_builder_with_priority(
+            setting_priority=None, resource_priority="high"
+        )
+        with patch.object(
+            builder,
+            "build_job_definition",
+            return_value=(_fake_job_def(), "snakejob-test"),
+        ):
+            with pytest.raises(WorkflowError, match="aws_batch_scheduling_priority"):
+                builder.submit()
+        builder.batch_client.submit_job.assert_not_called()
+
+    def test_zero_priority_is_forwarded(self):
+        """Priority of 0 is a valid fair-share value and must be included in the call
+        (regression pin against a future ``if priority:`` refactor)."""
+        builder = _make_builder_with_priority(
+            setting_priority=None, resource_priority=0
+        )
+        call_args = _run_submit_priority(builder)
+        assert call_args.kwargs["schedulingPriorityOverride"] == 0
+
+    def test_non_numeric_setting_raises_workflow_error(self):
+        """A non-numeric --aws-batch-scheduling-priority setting raises WorkflowError
+        and does not call submit_job.  Error message must mention the setting, not
+        the resource, because the bad value came from the CLI flag."""
+        builder = _make_builder_with_priority(
+            setting_priority="high", resource_priority=None
+        )
+        with patch.object(
+            builder,
+            "build_job_definition",
+            return_value=(_fake_job_def(), "snakejob-test"),
+        ):
+            with pytest.raises(WorkflowError, match="--aws-batch-scheduling-priority"):
+                builder.submit()
+        builder.batch_client.submit_job.assert_not_called()
+
+    def test_out_of_range_resource_raises_workflow_error(self):
+        """A priority outside the AWS Batch [0, 9999] range raises WorkflowError
+        before calling submit_job."""
+        builder = _make_builder_with_priority(
+            setting_priority=None, resource_priority=10000
+        )
+        with patch.object(
+            builder,
+            "build_job_definition",
+            return_value=(_fake_job_def(), "snakejob-test"),
+        ):
+            with pytest.raises(WorkflowError, match="range"):
+                builder.submit()
+        builder.batch_client.submit_job.assert_not_called()
+
+    def test_out_of_range_setting_raises_workflow_error(self):
+        """A workflow-level scheduling priority outside [0, 9999] raises WorkflowError."""  # noqa: E501
+        builder = _make_builder_with_priority(
+            setting_priority=10000, resource_priority=None
+        )
+        with patch.object(
+            builder,
+            "build_job_definition",
+            return_value=(_fake_job_def(), "snakejob-test"),
+        ):
+            with pytest.raises(WorkflowError, match="range"):
+                builder.submit()
+        builder.batch_client.submit_job.assert_not_called()
+
+    def test_negative_priority_raises_workflow_error(self):
+        """A negative priority is below the AWS Batch minimum (0) and must raise
+        WorkflowError before calling submit_job (lower-bound regression pin)."""
+        builder = _make_builder_with_priority(
+            setting_priority=None, resource_priority=-1
+        )
+        with patch.object(
+            builder,
+            "build_job_definition",
+            return_value=(_fake_job_def(), "snakejob-test"),
+        ):
+            with pytest.raises(WorkflowError, match="range"):
+                builder.submit()
+        builder.batch_client.submit_job.assert_not_called()
+
+    def test_max_valid_priority_is_forwarded(self):
+        """Priority of 9999 (AWS maximum) must be accepted and forwarded."""
+        builder = _make_builder_with_priority(
+            setting_priority=None, resource_priority=9999
+        )
+        call_args = _run_submit_priority(builder)
+        assert call_args.kwargs["schedulingPriorityOverride"] == 9999

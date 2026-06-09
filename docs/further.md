@@ -77,6 +77,36 @@ therefore pre-install a compatible version of the storage plugin (e.g.
 are responsible for pinning a plugin version compatible with the snakemake
 version in the image.
 
+# Scheduling Priority (Fair-Share Queues)
+
+AWS Batch fair-share job queues (those with a scheduling policy attached) order
+jobs by priority at submit time via `schedulingPriorityOverride`. The plugin
+exposes this at two levels, both optional:
+
+- `--aws-batch-scheduling-priority` — a workflow-level default applied to every
+  submitted job.
+- `aws_batch_scheduling_priority` resource — a per-rule override that takes
+  precedence over the workflow-level setting.
+
+Both are ignored by AWS on non-fair-share queues. When neither is set the
+`schedulingPriorityOverride` parameter is omitted entirely from the submit call,
+keeping submissions byte-identical to the pre-feature behavior.
+
+Workflow-level default (all jobs):
+
+```sh
+snakemake --executor aws-batch --aws-batch-scheduling-priority 50 ...
+```
+
+Per-rule override (e.g. boost the critical path above background jobs):
+
+```python
+rule critical_path:
+    resources:
+        aws_batch_scheduling_priority=100
+    ...
+```
+
 # Per-Rule Job Queues
 
 By default all jobs are submitted to the queue given by
