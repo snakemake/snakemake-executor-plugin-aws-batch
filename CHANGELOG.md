@@ -1,5 +1,24 @@
 # Changelog
 
+## [0.3.0](https://github.com/snakemake/snakemake-executor-plugin-aws-batch/compare/v0.2.1...v0.3.0) (2026-06-09)
+
+
+### Features
+
+* per-rule queues, per-job tags, EC2/Fargate-aware validation ([#40](https://github.com/snakemake/snakemake-executor-plugin-aws-batch/issues/40)) ([1d7d6e6](https://github.com/snakemake/snakemake-executor-plugin-aws-batch/commit/1d7d6e6f60c0329c748e07a8aa8cd0da254b8868))
+* per-rule task timeout via aws_batch_task_timeout resource ([#42](https://github.com/snakemake/snakemake-executor-plugin-aws-batch/issues/42)) ([f708eac](https://github.com/snakemake/snakemake-executor-plugin-aws-batch/commit/f708eac39c26c9295d521c8be3c0b52bf8e5fbdd))
+
+
+### Bug Fixes
+
+* Convert `log_info` dict to string for logging ([#35](https://github.com/snakemake/snakemake-executor-plugin-aws-batch/issues/35)) ([1933da1](https://github.com/snakemake/snakemake-executor-plugin-aws-batch/commit/1933da1639fa60f9ccd3882280b352ef6211e590))
+* don't apply a 300s default task timeout to every job ([#41](https://github.com/snakemake/snakemake-executor-plugin-aws-batch/issues/41)) ([96f8161](https://github.com/snakemake/snakemake-executor-plugin-aws-batch/commit/96f816122dc6e424e80564cb19169e84794d8694))
+
+
+### Documentation
+
+* doc link in README.md ([#27](https://github.com/snakemake/snakemake-executor-plugin-aws-batch/issues/27)) ([2525ca0](https://github.com/snakemake/snakemake-executor-plugin-aws-batch/commit/2525ca0ce5266fecc1fecd9f1750b2f8f397e560))
+
 ## [0.2.1](https://github.com/snakemake/snakemake-executor-plugin-aws-batch/compare/v0.2.0...v0.2.1) (2025-03-14)
 
 
