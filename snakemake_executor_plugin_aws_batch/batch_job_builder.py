@@ -378,6 +378,36 @@ class BatchJobBuilder:
         if tags:
             job_params["tags"] = tags
 
+        # Per-rule scheduling priority override for fair-share queues. The
+        # aws_batch_scheduling_priority resource takes precedence over the
+        # workflow-level scheduling_priority setting. When neither is set the
+        # kwarg is omitted entirely so submissions are byte-identical to today
+        # on non-fair-share queues.
+        resource_priority = self.job.resources.get("aws_batch_scheduling_priority")
+        setting_priority = getattr(self.settings, "scheduling_priority", None)
+        if resource_priority is not None:
+            priority = resource_priority
+            priority_source = "aws_batch_scheduling_priority resource"
+        elif setting_priority is not None:
+            priority = setting_priority
+            priority_source = "--aws-batch-scheduling-priority setting"
+        else:
+            priority = None
+            priority_source = ""
+        if priority is not None:
+            try:
+                priority_int = int(priority)
+            except (TypeError, ValueError) as e:
+                raise WorkflowError(
+                    f"Invalid {priority_source} {priority!r}: must be an integer."
+                ) from e
+            if not (0 <= priority_int <= 9999):
+                raise WorkflowError(
+                    f"Invalid {priority_source} {priority_int}: "
+                    "must be in range [0, 9999]."
+                )
+            job_params["schedulingPriorityOverride"] = priority_int
+
         try:
             submitted = self.batch_client.submit_job(**job_params)
             return submitted
