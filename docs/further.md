@@ -199,3 +199,54 @@ coordinator job can set the variable so that all child jobs it submits
 inherit the run-specific tags. AWS Batch allows at most 50 tags per job;
 malformed pairs (missing `=` or an empty key) raise an error at submission
 time.
+
+# Pre-existing Job Definitions
+
+By default the plugin registers a fresh AWS Batch job definition for every job
+and deregisters it afterward.  Accounts where job definitions are managed by
+infrastructure tooling (Terraform, CloudFormation) can opt out of this with
+`--aws-batch-job-definition`.  When set, the plugin skips
+`RegisterJobDefinition`/`DeregisterJobDefinition` entirely and instead submits
+with the supplied definition, pushing per-job specifics (command, environment
+variables, vcpu/mem/gpu) through `containerOverrides`.
+
+```bash
+snakemake --executor aws-batch \
+    --aws-batch-job-definition my-snakemake-def:3 \
+    ...
+```
+
+The value can be a bare name (`my-def`), a name:revision pair (`my-def:3`),
+or a full ARN
+(`arn:aws:batch:us-east-1:123456789012:job-definition/my-def:3`).
+
+A rule can override the setting for a specific job with the
+`aws_batch_job_definition` resource (mirrors the `batch_queue` pattern):
+
+```python
+rule align:
+    resources:
+        aws_batch_job_definition="gpu-enabled-def:2"
+    ...
+```
+
+**Incompatible combinations** — the following raise a `WorkflowError` at
+submission time because they are only meaningful when the plugin builds the
+definition:
+
+- `--aws-batch-job-role` (`job_role`): the job role is baked into the
+  definition at registration time and cannot be overridden via
+  `containerOverrides`.
+- The per-rule `shared_memory_size_mb` resource: `linuxParameters.sharedMemorySize`
+  is a definition-level field.
+
+The `--aws-batch-container-image` (`container_image`) setting and the per-rule
+`aws_batch_container_image` resource are both silently ignored in this mode — the
+container image is taken from the pre-existing definition.
+
+Task timeout and scheduling priority **are** still honored: `--aws-batch-task-timeout`
+(and the per-rule `aws_batch_task_timeout` resource) and the scheduling priority
+(`--aws-batch-scheduling-priority` / the per-rule `aws_batch_scheduling_priority`
+resource) travel as `SubmitJob`'s top-level `timeout` and `schedulingPriorityOverride`
+fields, so they apply to pre-existing definitions just as they do to dynamically
+registered ones.
