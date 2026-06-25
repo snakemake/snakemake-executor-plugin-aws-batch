@@ -46,6 +46,12 @@ rule my_rule:
 
 This allows you to use different containers with specialized tools for different rules within the same workflow, rather than requiring all tools to be present in a single container.
 
+Each rule-specific image must still satisfy the same requirements as the global
+container image (see [Container Image Requirements](#container-image-requirements)
+below): the worker runs `snakemake` inside the container, so the image must have
+Snakemake and a compatible storage plugin installed. A plain tool image that does
+not include Snakemake will fail to launch the job.
+
 # Example
 
 ## Create environment
