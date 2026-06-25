@@ -153,11 +153,17 @@ class Executor(RemoteExecutor):
         # argument 'external_job_id'.
 
         try:
+            # Use rule-level container image if specified via resources,
+            # otherwise fall back to global container image
+            container_image = job.resources.get(
+                "aws_batch_container_image", self.container_image
+            )
+
             job_definition = BatchJobBuilder(
                 logger=self.logger,
                 job=job,
                 envvars=self.envvars(),
-                container_image=self.container_image,
+                container_image=container_image,
                 settings=self.settings,
                 job_command=self.format_job_exec(job),
                 batch_client=self.batch_client,

@@ -977,3 +977,57 @@ class TestSubmitSchedulingPriority:
         )
         call_args = _run_submit_priority(builder)
         assert call_args.kwargs["schedulingPriorityOverride"] == 9999
+
+
+# ---------------------------------------------------------------------------
+# Tests for the per-rule aws_batch_container_image resource (Executor.run_job)
+# ---------------------------------------------------------------------------
+
+
+def _run_job_capture_container_image(
+    resources: dict, global_image: str = "global-image:latest"
+) -> str:
+    """Call Executor.run_job with the given job.resources (BatchJobBuilder mocked)
+    and return the container_image it passed to BatchJobBuilder."""
+    from snakemake_executor_plugin_aws_batch import Executor
+
+    executor = object.__new__(Executor)
+    executor.logger = MagicMock()
+    executor.batch_client = MagicMock()
+    executor.settings = SimpleNamespace(
+        job_queue="test-queue", job_role="test-role", tags=None, task_timeout=None
+    )
+    executor.container_image = global_image
+    executor.envvars = MagicMock(return_value={})
+    executor.format_job_exec = MagicMock(return_value="snakemake ...")
+    executor.report_job_submission = MagicMock()
+
+    job = MagicMock()
+    job.resources = resources
+
+    with patch("snakemake_executor_plugin_aws_batch.BatchJobBuilder") as mock_cls:
+        instance = mock_cls.return_value
+        instance.submit.return_value = {
+            "jobName": "snakejob-test",
+            "jobId": "abc-123",
+            "jobQueue": "test-queue",
+        }
+        instance.job_queue = "test-queue"
+        executor.run_job(job)
+    return mock_cls.call_args.kwargs["container_image"]
+
+
+class TestRunJobContainerImage:
+    """Executor.run_job resolves the per-rule aws_batch_container_image resource."""
+
+    def test_rule_resource_overrides_global_image(self):
+        """The aws_batch_container_image resource must override the global image."""
+        image = _run_job_capture_container_image(
+            {"aws_batch_container_image": "rule-image:v2"}
+        )
+        assert image == "rule-image:v2"
+
+    def test_falls_back_to_global_when_resource_absent(self):
+        """With no per-rule resource, run_job must use the global container image."""
+        image = _run_job_capture_container_image({})
+        assert image == "global-image:latest"
