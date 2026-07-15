@@ -1,5 +1,10 @@
 from enum import Enum
 
+# Batch job-queue / compute-environment `status` values that definitively
+# prevent jobs from running. CREATING/UPDATING are transient and must NOT fail
+# the preflight check (a queue mid-update is recoverable), so only these abort.
+FATAL_BATCH_STATUSES = frozenset({"INVALID", "DELETING", "DELETED"})
+
 VALID_RESOURCES_MAPPING = {
     2048: [1],
     3072: [1],
