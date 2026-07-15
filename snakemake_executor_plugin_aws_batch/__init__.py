@@ -6,6 +6,10 @@ __license__ = "MIT"
 from dataclasses import dataclass, field
 from pprint import pformat
 from typing import List, AsyncGenerator, Optional
+
+import boto3
+from botocore.exceptions import ClientError
+
 from snakemake_executor_plugin_aws_batch.batch_client import BatchClient
 from snakemake_executor_plugin_aws_batch.batch_job_builder import BatchJobBuilder
 from snakemake_interface_executor_plugins.executors.base import SubmittedJobInfo
@@ -18,6 +22,12 @@ from snakemake_interface_executor_plugins.jobs import (
     JobExecutorInterface,
 )
 from snakemake_interface_common.exceptions import WorkflowError
+
+
+# Batch job-queue / compute-environment `status` values that definitively
+# prevent jobs from running. CREATING/UPDATING are transient and must NOT fail
+# the preflight check (a queue mid-update is recoverable), so only these abort.
+FATAL_BATCH_STATUSES = frozenset({"INVALID", "DELETING", "DELETED"})
 
 
 # Optional:
@@ -157,6 +167,10 @@ class Executor(RemoteExecutor):
             self.batch_client = BatchClient(region_name=self.settings.region)
         except Exception as e:
             raise WorkflowError(f"Failed to initialize AWS Batch client: {e}") from e
+
+        # Fail fast on a definitively misconfigured queue/compute environment/role
+        # before submitting any jobs (degrades to a no-op if state is uncertain).
+        self._preflight_validate()
 
     def run_job(self, job: JobExecutorInterface):
         # Implement here how to run a job.
@@ -329,3 +343,136 @@ class Executor(RemoteExecutor):
         # cleanup jobs
         for j in active_jobs:
             self.cleanup_job_resources(j)
+
+    def _preflight_validate(self) -> None:
+        """Fail fast on a definitively misconfigured queue / compute env / role.
+
+        Best-effort about *uncertainty*: a transient API error or a missing
+        describe/iam permission degrades to a warning and the workflow proceeds.
+        Only a confirmed-bad configuration (disabled/invalid queue or compute
+        environment, ``maxvCpus=0``, or a non-existent job role) raises, before
+        any job is submitted.
+        """
+        problems = self._queue_problems()
+        if problems:
+            raise WorkflowError(
+                "AWS Batch preflight check failed — jobs would never start: "
+                + "; ".join(problems)
+                + ". Check the configured --aws-batch-job-queue and its compute "
+                "environment(s)."
+            )
+        self._validate_job_role()
+
+    def _queue_problems(self) -> Optional[List[str]]:
+        """Return definitive job-queue / compute-environment misconfigurations.
+
+        Returns an empty list when everything looks healthy, a non-empty list of
+        problem descriptions when the queue or a compute environment is in a
+        state that would prevent jobs from ever starting (disabled/invalid,
+        ``maxvCpus=0``), or None when the state can't be determined (no queue
+        configured, or the queue describe itself failed — never block the
+        workflow on a transient failure or a missing describe permission).
+
+        The queue and compute-environment lookups fail independently: a failure
+        describing the compute environment(s) (e.g. a missing
+        ``batch:DescribeComputeEnvironments`` permission) still returns any
+        confirmed queue-level problems collected so far rather than discarding
+        them, so a definitively disabled/invalid queue is never masked by an
+        unrelated failure downstream.
+
+        Compute environments are judged collectively: AWS Batch falls back
+        across a queue's ``computeEnvironmentOrder``, so a compute-environment
+        problem is reported only when *every* attached environment is unusable —
+        one healthy environment is enough for jobs to run.
+        """
+        queue_arn = getattr(self.settings, "job_queue", None)
+        if not queue_arn:
+            return None
+        # If we can't even describe the queue, the state is unknown — degrade to
+        # a no-op rather than blocking the workflow on a transient failure or a
+        # missing batch:DescribeJobQueues permission.
+        try:
+            queues = self.batch_client.describe_job_queues(jobQueues=[queue_arn]).get(
+                "jobQueues", []
+            )
+        except Exception as e:
+            self.logger.debug(f"could not check job queue: {e}")
+            return None
+        if not queues:
+            return ["job queue not found"]
+        jq = queues[0]
+        problems: List[str] = []
+        if jq.get("state") != "ENABLED":
+            problems.append(f"job queue is {jq.get('state')} (not ENABLED)")
+        if jq.get("status") in FATAL_BATCH_STATUSES:
+            problems.append(f"job queue status is {jq.get('status')}")
+        ce_arns = [
+            o.get("computeEnvironment") for o in jq.get("computeEnvironmentOrder", [])
+        ]
+        ce_arns = [c for c in ce_arns if c]
+        if ce_arns:
+            # A failure here must NOT discard the confirmed queue-level problems
+            # already collected above — return them instead of None.
+            try:
+                ces = self.batch_client.describe_compute_environments(
+                    computeEnvironments=ce_arns
+                ).get("computeEnvironments", [])
+            except Exception as e:
+                self.logger.debug(f"could not check compute environment(s): {e}")
+                return problems
+            # AWS Batch tries a queue's compute environments in order and falls
+            # back to the next, so jobs are only definitively blocked when EVERY
+            # attached compute environment is unusable. Collect per-CE reasons
+            # but surface them only when none is usable — one healthy compute
+            # environment is enough for jobs to run.
+            ce_reasons: List[str] = []
+            any_usable = False
+            for ce in ces:
+                name = ce.get("computeEnvironmentName", "?")
+                reasons: List[str] = []
+                if ce.get("state") != "ENABLED":
+                    reasons.append(f"compute environment {name} is {ce.get('state')}")
+                if ce.get("status") in FATAL_BATCH_STATUSES:
+                    reasons.append(
+                        f"compute environment {name} status is {ce.get('status')}"
+                    )
+                if (ce.get("computeResources") or {}).get("maxvCpus") == 0:
+                    reasons.append(f"compute environment {name} has maxvCpus=0")
+                if reasons:
+                    ce_reasons.extend(reasons)
+                else:
+                    any_usable = True
+            if ces and not any_usable:
+                problems.append(
+                    "no usable compute environment on the job queue: "
+                    + "; ".join(ce_reasons)
+                )
+        return problems
+
+    def _validate_job_role(self) -> None:
+        """Verify the configured job role exists (best-effort; needs iam:GetRole).
+
+        A confirmed-missing role (``NoSuchEntity``) fails fast; anything else
+        (most importantly a missing ``iam:GetRole`` permission) degrades silently
+        so the check never blocks a workflow on uncertainty.
+        """
+        role_arn = getattr(self.settings, "job_role", None)
+        if not role_arn or "/" not in role_arn:
+            return
+        # GetRole takes the bare role name, not the IAM path: for
+        # arn:aws:iam::<acct>:role/<path>/<name> the name is the final segment.
+        role_name = role_arn.rsplit("/", 1)[-1]
+        try:
+            boto3.client("iam", region_name=self.settings.region).get_role(
+                RoleName=role_name
+            )
+        except ClientError as e:
+            if e.response.get("Error", {}).get("Code") == "NoSuchEntity":
+                raise WorkflowError(
+                    f"Configured AWS Batch job role does not exist: {role_arn}"
+                ) from e
+            self.logger.debug(
+                f"could not verify job role (likely missing iam:GetRole): {e}"
+            )
+        except Exception as e:
+            self.logger.debug(f"could not verify job role: {e}")

@@ -250,3 +250,20 @@ Task timeout and scheduling priority **are** still honored: `--aws-batch-task-ti
 resource) travel as `SubmitJob`'s top-level `timeout` and `schedulingPriorityOverride`
 fields, so they apply to pre-existing definitions just as they do to dynamically
 registered ones.
+
+# Preflight Validation
+
+At startup (before submitting any job) the executor verifies that the
+configured job queue is `ENABLED` and `VALID`, that its compute environment(s)
+are `ENABLED`/`VALID` with `maxvCpus > 0`, and — when `--aws-batch-job-role` is
+set and `iam:GetRole` is available — that the job role exists. A confirmed
+misconfiguration (a disabled/invalid queue or compute environment, `maxvCpus=0`,
+or a non-existent job role) fails fast with a clear error, so you don't wait for
+jobs that could never start.
+
+The check is deliberately conservative about *uncertainty*: a transient API
+error, a queue mid-update (`status` `CREATING`/`UPDATING`), or a missing
+`batch:Describe*` / `iam:GetRole` permission is treated as a warning and the
+workflow proceeds. It uses the `batch:DescribeJobQueues` /
+`batch:DescribeComputeEnvironments` permissions the executor already needs, plus
+the optional `iam:GetRole` for the job-role check.
