@@ -89,6 +89,23 @@ class ExecutorSettings(ExecutorSettingsBase):
             "required": False,
         },
     )
+    job_definition: Optional[str] = field(
+        default=None,
+        metadata={
+            "help": (
+                "Use a pre-existing AWS Batch job definition instead of registering "
+                "one per job. Accepts a definition name (e.g. my-def), a name:revision "
+                "pair (my-def:3), or a full ARN. When set, resource configuration "
+                "(container image, job role, shared memory) is managed externally — "
+                "the container_image setting is ignored. Per-job specifics (command, "
+                "environment variables, vcpu/mem/gpu) are passed via "
+                "containerOverrides. Cannot be combined with --aws-batch-job-role "
+                "or the per-rule shared_memory_size_mb resource."
+            ),
+            "env_var": False,
+            "required": False,
+        },
+    )
 
 
 # Required:
@@ -153,11 +170,17 @@ class Executor(RemoteExecutor):
         # argument 'external_job_id'.
 
         try:
+            # Use rule-level container image if specified via resources,
+            # otherwise fall back to global container image
+            container_image = job.resources.get(
+                "aws_batch_container_image", self.container_image
+            )
+
             job_definition = BatchJobBuilder(
                 logger=self.logger,
                 job=job,
                 envvars=self.envvars(),
-                container_image=self.container_image,
+                container_image=container_image,
                 settings=self.settings,
                 job_command=self.format_job_exec(job),
                 batch_client=self.batch_client,
@@ -271,6 +294,15 @@ class Executor(RemoteExecutor):
     def _deregister_job(self, job: SubmittedJobInfo):
         """deregister batch job definition"""
         try:
+            # Pre-existing job definitions are not owned by this executor;
+            # deregistering them would break other workflows using the same definition.
+            if job.aux.get("_preexisting_job_definition"):
+                self.logger.debug(
+                    "skipping deregistration of pre-existing Batch job definition "
+                    f"{job.aux.get('job_definition_arn')} "
+                    "(externally managed, not owned by this executor)"
+                )
+                return
             job_def_arn = job.aux.get("job_definition_arn")
             if job_def_arn is not None:
                 self.logger.debug(f"de-registering Batch job definition {job_def_arn}")

@@ -28,6 +28,30 @@ SNAKEMAKE_AWS_BATCH_REGION
 SNAKEMAKE_AWS_BATCH_JOB_QUEUE
 SNAKEMAKE_AWS_BATCH_JOB_ROLE
 
+# Rule-Specific Container Images
+
+By default, all jobs use the global container image specified via `--container-image`. However, you can specify a different container image for individual rules using the `aws_batch_container_image` resource parameter:
+
+```python
+rule my_rule:
+    input:
+        "input.txt"
+    output:
+        "output.txt"
+    resources:
+        aws_batch_container_image="my-custom-image:tag"
+    shell:
+        "process_data.sh {input} {output}"
+```
+
+This allows you to use different containers with specialized tools for different rules within the same workflow, rather than requiring all tools to be present in a single container.
+
+Each rule-specific image must still satisfy the same requirements as the global
+container image (see [Container Image Requirements](#container-image-requirements)
+below): the worker runs `snakemake` inside the container, so the image must have
+Snakemake and a compatible storage plugin installed. A plain tool image that does
+not include Snakemake will fail to launch the job.
+
 # Example
 
 ## Create environment
@@ -175,3 +199,54 @@ coordinator job can set the variable so that all child jobs it submits
 inherit the run-specific tags. AWS Batch allows at most 50 tags per job;
 malformed pairs (missing `=` or an empty key) raise an error at submission
 time.
+
+# Pre-existing Job Definitions
+
+By default the plugin registers a fresh AWS Batch job definition for every job
+and deregisters it afterward.  Accounts where job definitions are managed by
+infrastructure tooling (Terraform, CloudFormation) can opt out of this with
+`--aws-batch-job-definition`.  When set, the plugin skips
+`RegisterJobDefinition`/`DeregisterJobDefinition` entirely and instead submits
+with the supplied definition, pushing per-job specifics (command, environment
+variables, vcpu/mem/gpu) through `containerOverrides`.
+
+```bash
+snakemake --executor aws-batch \
+    --aws-batch-job-definition my-snakemake-def:3 \
+    ...
+```
+
+The value can be a bare name (`my-def`), a name:revision pair (`my-def:3`),
+or a full ARN
+(`arn:aws:batch:us-east-1:123456789012:job-definition/my-def:3`).
+
+A rule can override the setting for a specific job with the
+`aws_batch_job_definition` resource (mirrors the `batch_queue` pattern):
+
+```python
+rule align:
+    resources:
+        aws_batch_job_definition="gpu-enabled-def:2"
+    ...
+```
+
+**Incompatible combinations** — the following raise a `WorkflowError` at
+submission time because they are only meaningful when the plugin builds the
+definition:
+
+- `--aws-batch-job-role` (`job_role`): the job role is baked into the
+  definition at registration time and cannot be overridden via
+  `containerOverrides`.
+- The per-rule `shared_memory_size_mb` resource: `linuxParameters.sharedMemorySize`
+  is a definition-level field.
+
+The `--aws-batch-container-image` (`container_image`) setting and the per-rule
+`aws_batch_container_image` resource are both silently ignored in this mode — the
+container image is taken from the pre-existing definition.
+
+Task timeout and scheduling priority **are** still honored: `--aws-batch-task-timeout`
+(and the per-rule `aws_batch_task_timeout` resource) and the scheduling priority
+(`--aws-batch-scheduling-priority` / the per-rule `aws_batch_scheduling_priority`
+resource) travel as `SubmitJob`'s top-level `timeout` and `schedulingPriorityOverride`
+fields, so they apply to pre-existing definitions just as they do to dynamically
+registered ones.

@@ -304,15 +304,34 @@ class TestGetPlatformFromQueue:
             {"Error": {"Code": "AccessDeniedException", "Message": "no perm"}},
             "DescribeJobQueues",
         )
+        # Platform is resolved lazily, so the error surfaces on first access.
+        builder = self._build(batch_client)
         with pytest.raises(WorkflowError, match="Failed to determine platform"):
-            self._build(batch_client)
+            _ = builder.platform
 
     def test_unexpected_exception_propagates(self):
         """Unexpected (non-ClientError) exceptions must propagate."""
         batch_client = MagicMock()
         batch_client.describe_job_queues.side_effect = RuntimeError("boom")
+        builder = self._build(batch_client)
         with pytest.raises(RuntimeError, match="boom"):
-            self._build(batch_client)
+            _ = builder.platform
+
+    def test_platform_not_resolved_at_construction(self):
+        """Constructing a builder must not query the queue — resolution is lazy."""
+        batch_client = MagicMock()
+        batch_client.describe_job_queues.return_value = {"jobQueues": []}
+        self._build(batch_client)
+        batch_client.describe_job_queues.assert_not_called()
+
+    def test_platform_cached_after_first_access(self):
+        """The queue is queried once; subsequent accesses use the cached value."""
+        batch_client = MagicMock()
+        batch_client.describe_job_queues.return_value = {"jobQueues": []}
+        builder = self._build(batch_client)
+        _ = builder.platform
+        _ = builder.platform
+        batch_client.describe_job_queues.assert_called_once()
 
     def test_empty_queue_response_falls_back_to_ec2(self):
         """The explicit empty-response branch keeps the EC2 fallback."""
@@ -490,16 +509,18 @@ class TestErrorMessagesUseResolvedQueue:
             {"Error": {"Code": "AccessDeniedException", "Message": "no perm"}},
             "DescribeJobQueues",
         )
+        builder = BatchJobBuilder(
+            logger=MagicMock(),
+            job=self._make_job_with_queue_override(),
+            envvars={},
+            container_image="test-image:latest",
+            settings=self._make_settings(),
+            job_command="snakemake ...",
+            batch_client=batch_client,
+        )
+        # Platform is resolved lazily, so the error surfaces on first access.
         with pytest.raises(WorkflowError, match="override-queue"):
-            BatchJobBuilder(
-                logger=MagicMock(),
-                job=self._make_job_with_queue_override(),
-                envvars={},
-                container_image="test-image:latest",
-                settings=self._make_settings(),
-                job_command="snakemake ...",
-                batch_client=batch_client,
-            )
+            _ = builder.platform
 
     def test_fargate_rejection_reports_resolved_queue(self):
         """The Fargate fail-fast message must name the per-job override queue."""
@@ -977,3 +998,503 @@ class TestSubmitSchedulingPriority:
         )
         call_args = _run_submit_priority(builder)
         assert call_args.kwargs["schedulingPriorityOverride"] == 9999
+
+
+# ---------------------------------------------------------------------------
+# Tests for the per-rule aws_batch_container_image resource (Executor.run_job)
+# ---------------------------------------------------------------------------
+
+
+def _run_job_capture_container_image(
+    resources: dict, global_image: str = "global-image:latest"
+) -> str:
+    """Call Executor.run_job with the given job.resources (BatchJobBuilder mocked)
+    and return the container_image it passed to BatchJobBuilder."""
+    from snakemake_executor_plugin_aws_batch import Executor
+
+    executor = object.__new__(Executor)
+    executor.logger = MagicMock()
+    executor.batch_client = MagicMock()
+    executor.settings = SimpleNamespace(
+        job_queue="test-queue", job_role="test-role", tags=None, task_timeout=None
+    )
+    executor.container_image = global_image
+    executor.envvars = MagicMock(return_value={})
+    executor.format_job_exec = MagicMock(return_value="snakemake ...")
+    executor.report_job_submission = MagicMock()
+
+    job = MagicMock()
+    job.resources = resources
+
+    with patch("snakemake_executor_plugin_aws_batch.BatchJobBuilder") as mock_cls:
+        instance = mock_cls.return_value
+        instance.submit.return_value = {
+            "jobName": "snakejob-test",
+            "jobId": "abc-123",
+            "jobQueue": "test-queue",
+        }
+        instance.job_queue = "test-queue"
+        executor.run_job(job)
+    return mock_cls.call_args.kwargs["container_image"]
+
+
+class TestRunJobContainerImage:
+    """Executor.run_job resolves the per-rule aws_batch_container_image resource."""
+
+    def test_rule_resource_overrides_global_image(self):
+        """The aws_batch_container_image resource must override the global image."""
+        image = _run_job_capture_container_image(
+            {"aws_batch_container_image": "rule-image:v2"}
+        )
+        assert image == "rule-image:v2"
+
+    def test_falls_back_to_global_when_resource_absent(self):
+        """With no per-rule resource, run_job must use the global container image."""
+        image = _run_job_capture_container_image({})
+        assert image == "global-image:latest"
+
+
+# ---------------------------------------------------------------------------
+# Tests for pre-existing job definitions (--aws-batch-job-definition)
+# ---------------------------------------------------------------------------
+
+
+def _make_builder_with_preexisting(
+    job_definition: str = "my-job-def",
+    resources: dict | None = None,
+    job_role: str | None = None,
+    envvars: dict | None = None,
+    threads: int = 2,
+) -> BatchJobBuilder:
+    """Return a BatchJobBuilder configured with a pre-existing job definition."""
+    if resources is None:
+        resources = {"_cores": 2, "mem_mb": 2048}
+    settings = SimpleNamespace(
+        job_queue="test-queue",
+        job_role=job_role,
+        job_definition=job_definition,
+        tags=None,
+        task_timeout=300,
+    )
+    batch_client = MagicMock()
+    batch_client.describe_job_queues.return_value = {"jobQueues": []}
+    job = MagicMock()
+    job.name = "test_rule"
+    job.threads = threads
+    job.resources = resources
+    return BatchJobBuilder(
+        logger=MagicMock(),
+        job=job,
+        envvars=envvars or {},
+        container_image="test-image:latest",
+        settings=settings,
+        job_command="snakemake --jobs 1",
+        batch_client=batch_client,
+    )
+
+
+class TestPreExistingJobDefinition:
+    """Pre-existing job definition mode: skip register, use containerOverrides."""
+
+    # --- submit uses supplied definition, no register call ---
+
+    def test_submit_uses_preexisting_definition_no_register(self):
+        """submit() must use the pre-existing definition and skip register."""
+        builder = _make_builder_with_preexisting(job_definition="my-job-def")
+        builder.batch_client.submit_job.return_value = {
+            "jobName": "snakejob-test",
+            "jobId": "abc-123",
+        }
+        builder.submit()
+        builder.batch_client.register_job_definition.assert_not_called()
+        call_kwargs = builder.batch_client.submit_job.call_args.kwargs
+        assert call_kwargs["jobDefinition"] == "my-job-def"
+
+    def test_submit_with_arn_definition(self):
+        """An ARN-form pre-existing definition must be passed through unchanged."""
+        arn = "arn:aws:batch:us-east-1:123456789012:job-definition/my-def:5"
+        builder = _make_builder_with_preexisting(job_definition=arn)
+        builder.batch_client.submit_job.return_value = {
+            "jobName": "snakejob-test",
+            "jobId": "abc-123",
+        }
+        builder.submit()
+        call_kwargs = builder.batch_client.submit_job.call_args.kwargs
+        assert call_kwargs["jobDefinition"] == arn
+
+    # --- containerOverrides carries command, env, vcpu, mem ---
+
+    def test_container_overrides_has_command(self):
+        builder = _make_builder_with_preexisting(job_definition="my-job-def")
+        builder.batch_client.submit_job.return_value = {
+            "jobName": "snakejob-test",
+            "jobId": "abc-123",
+        }
+        builder.submit()
+        call_kwargs = builder.batch_client.submit_job.call_args.kwargs
+        overrides = call_kwargs["containerOverrides"]
+        assert overrides["command"] == ["/bin/bash", "-c", "snakemake --jobs 1"]
+
+    def test_container_overrides_has_vcpu_and_mem(self):
+        builder = _make_builder_with_preexisting(
+            resources={"_cores": 4, "mem_mb": 8192}, threads=4
+        )
+        builder.batch_client.submit_job.return_value = {
+            "jobName": "snakejob-test",
+            "jobId": "abc-123",
+        }
+        builder.submit()
+        overrides = builder.batch_client.submit_job.call_args.kwargs[
+            "containerOverrides"
+        ]
+        req_by_type = {r["type"]: r["value"] for r in overrides["resourceRequirements"]}
+        assert req_by_type["VCPU"] == "4"
+        assert req_by_type["MEMORY"] == "8192"
+
+    def test_container_overrides_has_environment(self):
+        builder = _make_builder_with_preexisting(
+            job_definition="my-job-def",
+            envvars={"MY_VAR": "hello", "ANOTHER": "world"},
+        )
+        builder.batch_client.submit_job.return_value = {
+            "jobName": "snakejob-test",
+            "jobId": "abc-123",
+        }
+        builder.submit()
+        overrides = builder.batch_client.submit_job.call_args.kwargs[
+            "containerOverrides"
+        ]
+        env_map = {e["name"]: e["value"] for e in overrides.get("environment", [])}
+        assert env_map["MY_VAR"] == "hello"
+        assert env_map["ANOTHER"] == "world"
+
+    # --- tags flow through _build_job_tags() into submit_job ---
+
+    def test_tags_forwarded_in_preexisting_mode(self):
+        """Settings tags must reach submit_job via the same _build_job_tags() path."""
+        builder = _make_builder_with_preexisting(job_definition="my-job-def")
+        builder.settings.tags = {"Env": "prod", "Project": "fgumi"}
+        builder.batch_client.submit_job.return_value = {
+            "jobName": "snakejob-test",
+            "jobId": "abc-123",
+        }
+        builder.submit()
+        call_kwargs = builder.batch_client.submit_job.call_args.kwargs
+        assert call_kwargs["tags"] == {"Env": "prod", "Project": "fgumi"}
+
+    def test_container_overrides_no_gpu_when_zero(self):
+        """GPU must NOT appear in resourceRequirements when gpu == 0."""
+        builder = _make_builder_with_preexisting(
+            resources={"_cores": 2, "mem_mb": 2048, "_gpus": 0}
+        )
+        builder.batch_client.submit_job.return_value = {
+            "jobName": "snakejob-test",
+            "jobId": "abc-123",
+        }
+        builder.submit()
+        overrides = builder.batch_client.submit_job.call_args.kwargs[
+            "containerOverrides"
+        ]
+        types = [r["type"] for r in overrides["resourceRequirements"]]
+        assert "GPU" not in types
+
+    def test_container_overrides_includes_gpu_when_set(self):
+        """GPU must appear in resourceRequirements when gpu > 0."""
+        builder = _make_builder_with_preexisting(
+            resources={"_cores": 4, "mem_mb": 4096, "_gpus": 2}, threads=4
+        )
+        builder.batch_client.submit_job.return_value = {
+            "jobName": "snakejob-test",
+            "jobId": "abc-123",
+        }
+        builder.submit()
+        overrides = builder.batch_client.submit_job.call_args.kwargs[
+            "containerOverrides"
+        ]
+        req_by_type = {r["type"]: r["value"] for r in overrides["resourceRequirements"]}
+        assert req_by_type["GPU"] == "2"
+
+    # --- per-rule aws_batch_job_definition resource override ---
+
+    def test_per_rule_resource_overrides_setting(self):
+        """resources.aws_batch_job_definition overrides the settings value."""
+        builder = _make_builder_with_preexisting(
+            job_definition="default-def",
+            resources={
+                "_cores": 2,
+                "mem_mb": 2048,
+                "aws_batch_job_definition": "per-rule-def",
+            },
+        )
+        builder.batch_client.submit_job.return_value = {
+            "jobName": "snakejob-test",
+            "jobId": "abc-123",
+        }
+        builder.submit()
+        call_kwargs = builder.batch_client.submit_job.call_args.kwargs
+        assert call_kwargs["jobDefinition"] == "per-rule-def"
+        builder.batch_client.register_job_definition.assert_not_called()
+
+    # --- incompatible setting combinations raise WorkflowError ---
+
+    def test_job_role_plus_job_definition_raises(self):
+        """job_role + job_definition must raise WorkflowError immediately."""
+        builder = _make_builder_with_preexisting(
+            job_definition="my-job-def",
+            job_role="arn:aws:iam::123456789:role/my-role",
+        )
+        with pytest.raises(WorkflowError, match="job_role"):
+            builder.submit()
+        builder.batch_client.register_job_definition.assert_not_called()
+        builder.batch_client.submit_job.assert_not_called()
+
+    def test_shared_memory_size_mb_plus_job_definition_raises(self):
+        """shared_memory_size_mb + job_definition must raise WorkflowError."""
+        builder = _make_builder_with_preexisting(
+            job_definition="my-job-def",
+            resources={"_cores": 2, "mem_mb": 2048, "shared_memory_size_mb": 4096},
+        )
+        with pytest.raises(WorkflowError, match="shared_memory_size_mb"):
+            builder.submit()
+        builder.batch_client.register_job_definition.assert_not_called()
+        builder.batch_client.submit_job.assert_not_called()
+
+    def test_shared_memory_size_mb_zero_plus_job_definition_raises(self):
+        """An explicit shared_memory_size_mb=0 must also raise — the resource is
+        meaningless in pre-existing mode, and the dynamic path rejects 0 too."""
+        builder = _make_builder_with_preexisting(
+            job_definition="my-job-def",
+            resources={"_cores": 2, "mem_mb": 2048, "shared_memory_size_mb": 0},
+        )
+        with pytest.raises(WorkflowError, match="shared_memory_size_mb"):
+            builder.submit()
+        builder.batch_client.submit_job.assert_not_called()
+
+    # --- no platform discovery in pre-existing mode (smaller IAM surface) ---
+
+    def test_no_queue_platform_discovery_in_preexisting_mode(self):
+        """Pre-existing mode must not query the queue — that would force
+        DescribeJobQueues/DescribeComputeEnvironments IAM the mode aims to avoid."""
+        builder = _make_builder_with_preexisting(job_definition="my-job-def")
+        builder.batch_client.submit_job.return_value = {
+            "jobName": "snakejob-test",
+            "jobId": "abc-123",
+        }
+        builder.submit()
+        builder.batch_client.describe_job_queues.assert_not_called()
+        builder.batch_client.describe_compute_environments.assert_not_called()
+
+    # --- task timeout is mirrored into the pre-existing path ---
+
+    def test_task_timeout_forwarded_in_preexisting_mode(self):
+        """The dynamic path bakes timeout into the definition; pre-existing mode
+        must forward it as SubmitJob's top-level timeout field instead."""
+        builder = _make_builder_with_preexisting(job_definition="my-job-def")
+        builder.settings.task_timeout = 600
+        builder.batch_client.submit_job.return_value = {
+            "jobName": "snakejob-test",
+            "jobId": "abc-123",
+        }
+        builder.submit()
+        call_kwargs = builder.batch_client.submit_job.call_args.kwargs
+        assert call_kwargs["timeout"] == {"attemptDurationSeconds": 600}
+
+    def test_per_rule_task_timeout_overrides_setting_in_preexisting_mode(self):
+        """The aws_batch_task_timeout resource takes precedence over the setting."""
+        builder = _make_builder_with_preexisting(
+            job_definition="my-job-def",
+            resources={
+                "_cores": 2,
+                "mem_mb": 2048,
+                "aws_batch_task_timeout": 900,
+            },
+        )
+        builder.settings.task_timeout = 600
+        builder.batch_client.submit_job.return_value = {
+            "jobName": "snakejob-test",
+            "jobId": "abc-123",
+        }
+        builder.submit()
+        call_kwargs = builder.batch_client.submit_job.call_args.kwargs
+        assert call_kwargs["timeout"] == {"attemptDurationSeconds": 900}
+
+    def test_task_timeout_omitted_when_unset_in_preexisting_mode(self):
+        """No timeout field when neither resource nor setting is configured."""
+        builder = _make_builder_with_preexisting(job_definition="my-job-def")
+        builder.settings.task_timeout = None
+        builder.batch_client.submit_job.return_value = {
+            "jobName": "snakejob-test",
+            "jobId": "abc-123",
+        }
+        builder.submit()
+        call_kwargs = builder.batch_client.submit_job.call_args.kwargs
+        assert "timeout" not in call_kwargs
+
+    # --- no deregister for pre-existing definitions ---
+
+    def test_submitted_job_aux_marks_preexisting(self):
+        """Jobs submitted with a pre-existing definition must carry the
+        _preexisting_job_definition marker so deregister can skip them."""
+        builder = _make_builder_with_preexisting(job_definition="my-job-def")
+        builder.batch_client.submit_job.return_value = {
+            "jobName": "snakejob-test",
+            "jobId": "abc-123",
+        }
+        result = builder.submit()
+        assert result.get("_preexisting_job_definition") is True
+
+    # --- scheduling priority is mirrored into the pre-existing path ---
+
+    def test_scheduling_priority_forwarded_in_preexisting_mode(self):
+        """schedulingPriorityOverride must be mirrored from the dynamic path."""
+        builder = _make_builder_with_preexisting(job_definition="my-job-def")
+        builder.settings.scheduling_priority = 500
+        builder.batch_client.submit_job.return_value = {
+            "jobName": "snakejob-test",
+            "jobId": "abc-123",
+        }
+        builder.submit()
+        call_kwargs = builder.batch_client.submit_job.call_args.kwargs
+        assert call_kwargs["schedulingPriorityOverride"] == 500
+
+    def test_scheduling_priority_omitted_when_unset_in_preexisting_mode(self):
+        """schedulingPriorityOverride must be absent when no priority is set."""
+        builder = _make_builder_with_preexisting(job_definition="my-job-def")
+        builder.batch_client.submit_job.return_value = {
+            "jobName": "snakejob-test",
+            "jobId": "abc-123",
+        }
+        builder.submit()
+        call_kwargs = builder.batch_client.submit_job.call_args.kwargs
+        assert "schedulingPriorityOverride" not in call_kwargs
+
+    # --- default path unchanged when no pre-existing definition configured ---
+
+    def test_default_path_no_preexisting_def_still_registers(self):
+        """When job_definition is absent from settings, the dynamic path runs."""
+        builder = _make_builder(tags=None)  # settings has no job_definition attr
+        builder.batch_client.register_job_definition.return_value = _fake_job_def()
+        builder.batch_client.submit_job.return_value = {
+            "jobName": "snakejob-test",
+            "jobId": "abc-123",
+        }
+        builder.submit()
+        builder.batch_client.register_job_definition.assert_called_once()
+
+    def test_settings_job_definition_none_uses_dynamic_path(self):
+        """Explicit job_definition=None must fall through to the dynamic path."""
+        settings = SimpleNamespace(
+            job_queue="test-queue",
+            job_role="arn:aws:iam::123456789:role/role",
+            job_definition=None,
+            tags=None,
+            task_timeout=300,
+        )
+        batch_client = MagicMock()
+        batch_client.describe_job_queues.return_value = {"jobQueues": []}
+        batch_client.register_job_definition.return_value = _fake_job_def()
+        batch_client.submit_job.return_value = {
+            "jobName": "snakejob-test",
+            "jobId": "abc-123",
+        }
+        job = MagicMock()
+        job.name = "test_rule"
+        job.threads = 1
+        job.resources = {"_cores": 1, "mem_mb": 1024}
+        builder = BatchJobBuilder(
+            logger=MagicMock(),
+            job=job,
+            envvars={},
+            container_image="test-image:latest",
+            settings=settings,
+            job_command="snakemake ...",
+            batch_client=batch_client,
+        )
+        builder.submit()
+        batch_client.register_job_definition.assert_called_once()
+
+
+class TestDeregisterSkipsPreexisting:
+    """Executor._deregister_job must skip jobs that used a pre-existing definition."""
+
+    def _make_executor(self):
+        """Return a minimal Executor-like object with a real _deregister_job method."""
+        from snakemake_executor_plugin_aws_batch import Executor
+
+        executor = object.__new__(Executor)
+        executor.logger = MagicMock()
+        executor.batch_client = MagicMock()
+        return executor
+
+    def test_deregister_skipped_for_preexisting(self):
+        """_deregister_job must skip deregistration when _preexisting flag set."""
+        executor = self._make_executor()
+        job = MagicMock()
+        job.aux = {
+            "job_definition_arn": "arn:aws:batch:::job-definition/my-def:1",
+            "_preexisting_job_definition": True,
+        }
+        executor._deregister_job(job)
+        executor.batch_client.deregister_job_definition.assert_not_called()
+
+    def test_deregister_skip_logged_at_debug(self):
+        """Skipping a pre-existing definition must be logged at debug so operators
+        can tell why nothing was deregistered."""
+        executor = self._make_executor()
+        job = MagicMock()
+        job.aux = {
+            "job_definition_arn": "arn:aws:batch:::job-definition/my-def:1",
+            "_preexisting_job_definition": True,
+        }
+        executor._deregister_job(job)
+        executor.logger.debug.assert_called_once()
+        assert (
+            "skipping deregistration" in executor.logger.debug.call_args.args[0].lower()
+        )
+
+    def test_deregister_runs_for_dynamic_definition(self):
+        """_deregister_job must call deregister_job_definition for dynamic defs."""
+        executor = self._make_executor()
+        job = MagicMock()
+        job.aux = {
+            "job_definition_arn": "arn:aws:batch:::job-definition/snakejob-def:1",
+        }
+        executor._deregister_job(job)
+        executor.batch_client.deregister_job_definition.assert_called_once_with(
+            jobDefinition="arn:aws:batch:::job-definition/snakejob-def:1"
+        )
+
+    def test_marker_survives_real_flow_end_to_end(self):
+        """The _preexisting_job_definition marker must survive the full submit →
+        SubmittedJobInfo → _interpret_job_status aux-write → _deregister_job chain.
+
+        This locks the marker-survival property against a future refactor that
+        reassigns job.aux wholesale: if the marker is ever lost between submit() and
+        _deregister_job(), this test will catch it.
+        """
+        from snakemake_interface_executor_plugins.executors.base import SubmittedJobInfo
+
+        # 1. Call submit() in pre-existing mode with a mocked batch client.
+        builder = _make_builder_with_preexisting(job_definition="my-job-def")
+        builder.batch_client.submit_job.return_value = {
+            "jobName": "snakejob-test",
+            "jobId": "abc-123",
+        }
+        job_info = builder.submit()
+
+        # 2. Build SubmittedJobInfo exactly as run_job does.
+        mock_job = MagicMock()
+        submitted = SubmittedJobInfo(
+            job=mock_job, external_jobid=job_info["jobId"], aux=dict(job_info)
+        )
+
+        # 3. Simulate _interpret_job_status's in-place aux write (the real code
+        #    writes individual keys into the existing dict, not a reassignment).
+        submitted.aux[
+            "job_definition_arn"
+        ] = "arn:aws:batch:us-east-1:123456789012:job-definition/my-job-def:1"
+
+        # 4. Call _deregister_job and assert deregistration was skipped.
+        executor = self._make_executor()
+        executor._deregister_job(submitted)
+        executor.batch_client.deregister_job_definition.assert_not_called()
