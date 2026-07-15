@@ -57,9 +57,19 @@ class ExecutorSettings(ExecutorSettingsBase):
     job_role: Optional[str] = field(
         default=None,
         metadata={
-            "help": "The AWS job role ARN that is used for running the tasks",
+            "help": (
+                "The AWS job role ARN used to run the tasks. Required in the "
+                "default mode (it is baked into each per-job definition the "
+                "plugin registers), but optional when --aws-batch-job-definition "
+                "is set: a pre-existing job definition carries its own role, and "
+                "combining the two is rejected."
+            ),
             "env_var": True,
-            "required": True,
+            # Not `required: True`: a pre-existing job definition
+            # (--aws-batch-job-definition) supplies its own role, so job_role
+            # must be omittable there. Presence is enforced conditionally in
+            # _preflight_validate for the default (register-per-job) mode.
+            "required": False,
         },
     )
     tags: Optional[dict] = field(
@@ -349,10 +359,39 @@ class Executor(RemoteExecutor):
 
         Best-effort about *uncertainty*: a transient API error or a missing
         describe/iam permission degrades to a warning and the workflow proceeds.
-        Only a confirmed-bad configuration (disabled/invalid queue or compute
-        environment, ``maxvCpus=0``, or a non-existent job role) raises, before
-        any job is submitted.
+        Only a confirmed-bad configuration raises, before any job is submitted:
+        combining ``--aws-batch-job-role`` with ``--aws-batch-job-definition``,
+        or omitting ``--aws-batch-job-role`` without a pre-existing job
+        definition (both checked first), a disabled/invalid queue or compute
+        environment, ``maxvCpus=0``, or a non-existent job role.
         """
+        job_definition = getattr(self.settings, "job_definition", None)
+        job_role = getattr(self.settings, "job_role", None)
+
+        # Reject --aws-batch-job-role + --aws-batch-job-definition early, before
+        # _validate_job_role wastes an iam:GetRole call on a role that can never
+        # be used: a pre-existing job definition bakes in its own role. The
+        # per-job check in BatchJobBuilder must remain — a per-rule
+        # aws_batch_job_definition resource is not visible here at preflight time.
+        if job_definition and job_role:
+            raise WorkflowError(
+                "Cannot combine --aws-batch-job-role with "
+                "--aws-batch-job-definition: the job role is baked into a "
+                "pre-existing job definition and cannot be overridden per job. "
+                "Remove --aws-batch-job-role or omit --aws-batch-job-definition."
+            )
+        # job_role is not `required` at the settings layer so it can be omitted
+        # in pre-existing-definition mode; enforce it here for the default
+        # register-per-job path, where it is baked into each definition.
+        if not job_definition and not job_role:
+            raise WorkflowError(
+                "AWS Batch requires a job role in the default mode: pass "
+                "--aws-batch-job-role (or set SNAKEMAKE_AWS_BATCH_JOB_ROLE) so it "
+                "can be registered into each per-job definition. It is only "
+                "optional when you use a pre-existing job definition via "
+                "--aws-batch-job-definition, which carries its own role."
+            )
+
         problems = self._queue_problems()
         if problems:
             raise WorkflowError(

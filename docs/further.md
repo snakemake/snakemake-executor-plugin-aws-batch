@@ -210,6 +210,11 @@ infrastructure tooling (Terraform, CloudFormation) can opt out of this with
 with the supplied definition, pushing per-job specifics (command, environment
 variables, vcpu/mem/gpu) through `containerOverrides`.
 
+Because the pre-existing definition supplies its own role, `--aws-batch-job-role`
+is **not required** in this mode (it *is* required in the default register-per-job
+mode). Providing it alongside `--aws-batch-job-definition` is rejected — see
+*Incompatible combinations* below.
+
 ```bash
 snakemake --executor aws-batch \
     --aws-batch-job-definition my-snakemake-def:3 \
