@@ -14,12 +14,21 @@ import pytest
 from botocore.exceptions import ClientError
 from snakemake_interface_common.exceptions import WorkflowError
 
-from snakemake_executor_plugin_aws_batch import Executor
+from snakemake_executor_plugin_aws_batch import Executor, ExecutorSettings
 
 
 def _executor(**settings) -> Executor:
-    """Build a bare Executor (bypassing __post_init__) with mocks in place."""
-    base = {"region": "us-east-1", "job_queue": "arn:q", "job_role": None}
+    """Build a bare Executor (bypassing __post_init__) with mocks in place.
+
+    Defaults to a valid ``job_role`` — the realistic default (register-per-job)
+    configuration. Tests exercising pre-existing-definition mode pass
+    ``job_role=None`` explicitly.
+    """
+    base = {
+        "region": "us-east-1",
+        "job_queue": "arn:q",
+        "job_role": "arn:aws:iam::1:role/default",
+    }
     base.update(settings)
     ex = Executor.__new__(Executor)
     ex.logger = MagicMock()
@@ -308,6 +317,73 @@ class TestPreflightValidate:
 
     def test_no_queue_configured_does_not_raise(self):
         ex = _executor(job_queue=None)
+        ex._validate_job_role = MagicMock()
+        ex._preflight_validate()  # must not raise
+        ex._validate_job_role.assert_called_once()
+
+
+class TestPreflightJobDefinitionJobRoleCombo:
+    """`job_definition` + `job_role` must fail fast, before any queue/role call.
+
+    A pre-existing job definition bakes in its own role, so combining it with
+    `--aws-batch-job-role` can never work. The per-rule resource is caught later
+    in BatchJobBuilder; this covers the setting-level combo at preflight.
+    """
+
+    def test_both_set_raises_before_queue_or_role_checks(self):
+        ex = _executor(
+            job_definition="my-job-def",
+            job_role="arn:aws:iam::1:role/my-role",
+        )
+        ex._queue_problems = MagicMock()
+        ex._validate_job_role = MagicMock()
+        with pytest.raises(WorkflowError) as excinfo:
+            ex._preflight_validate()
+        msg = str(excinfo.value)
+        assert "--aws-batch-job-role" in msg
+        assert "--aws-batch-job-definition" in msg
+        # Specifically the combine error (distinguishable from any other message
+        # that might mention both flags).
+        assert "managed externally" in msg
+        # Fail fast: neither the queue describe nor the iam:GetRole check runs.
+        ex._queue_problems.assert_not_called()
+        ex._validate_job_role.assert_not_called()
+
+    def test_job_definition_only_does_not_raise(self):
+        # Pre-existing-definition mode: job_role omitted (it carries its own).
+        ex = _with_queue(
+            _executor(job_definition="my-job-def", job_role=None),
+            {"state": "ENABLED", "status": "VALID", "computeEnvironmentOrder": []},
+        )
+        ex._validate_job_role = MagicMock()
+        ex._preflight_validate()  # must not raise
+        ex._validate_job_role.assert_called_once()
+
+    def test_no_job_role_without_job_definition_passes_preflight(self):
+        # The "default mode requires a job role" rule is enforced per-job in
+        # BatchJobBuilder (where a per-rule aws_batch_job_definition resource is
+        # visible), NOT at global preflight — so preflight does not reject a
+        # role-less, definition-less global config here.
+        ex = _with_queue(
+            _executor(job_role=None),
+            {"state": "ENABLED", "status": "VALID", "computeEnvironmentOrder": []},
+        )
+        ex._validate_job_role = MagicMock()
+        ex._preflight_validate()  # must not raise
+        ex._validate_job_role.assert_called_once()
+
+    def test_job_role_setting_is_not_required(self):
+        # Pin the required:True -> required:False flip so a regression that makes
+        # job_role mandatory again (breaking pre-existing-definition mode) is
+        # caught.
+        field = ExecutorSettings.__dataclass_fields__["job_role"]
+        assert field.metadata["required"] is False
+
+    def test_job_role_only_preserves_existing_behaviour(self):
+        ex = _with_queue(
+            _executor(job_role="arn:aws:iam::1:role/my-role"),
+            {"state": "ENABLED", "status": "VALID", "computeEnvironmentOrder": []},
+        )
         ex._validate_job_role = MagicMock()
         ex._preflight_validate()  # must not raise
         ex._validate_job_role.assert_called_once()

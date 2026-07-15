@@ -327,6 +327,11 @@ infrastructure tooling (Terraform, CloudFormation) can opt out of this with
 with the supplied definition, pushing per-job specifics (command, environment
 variables, vcpu/mem/gpu) through `containerOverrides`.
 
+Because the pre-existing definition supplies its own role, `--aws-batch-job-role`
+is **not required** in this mode (it *is* required in the default register-per-job
+mode). Providing it alongside `--aws-batch-job-definition` is rejected — see
+*Incompatible combinations* below.
+
 ```bash
 snakemake --executor aws-batch \
     --aws-batch-job-definition my-snakemake-def:3 \
@@ -347,15 +352,17 @@ rule align:
     ...
 ```
 
-**Incompatible combinations** — the following raise a `WorkflowError` at
-submission time because they are only meaningful when the plugin builds the
+**Incompatible combinations** — the following are rejected with a
+`WorkflowError` because they are only meaningful when the plugin builds the
 definition:
 
 - `--aws-batch-job-role` (`job_role`): the job role is baked into the
   definition at registration time and cannot be overridden via
-  `containerOverrides`.
+  `containerOverrides`. Combined with the global `--aws-batch-job-definition` it
+  is rejected at **startup** (preflight); combined with a per-rule
+  `aws_batch_job_definition` resource it is rejected when that job is submitted.
 - The per-rule `shared_memory_size_mb` resource: `linuxParameters.sharedMemorySize`
-  is a definition-level field.
+  is a definition-level field (rejected at job submission).
 
 The `--aws-batch-container-image` (`container_image`) setting and the per-rule
 `aws_batch_container_image` resource are both silently ignored in this mode — the

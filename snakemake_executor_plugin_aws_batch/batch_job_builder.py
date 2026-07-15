@@ -212,6 +212,25 @@ class BatchJobBuilder:
                 f"Use an EC2-backed AWS Batch queue instead."
             )
 
+        # The default (register-per-job) path bakes the job role into each
+        # definition, so a role is mandatory here. It is only optional when a
+        # pre-existing job definition is used — the global
+        # --aws-batch-job-definition or the per-rule aws_batch_job_definition
+        # resource — which carries its own role and is dispatched via
+        # _submit_with_preexisting_definition before ever reaching this method.
+        # Enforcing this per-job (rather than at global preflight) lets a
+        # per-rule-definition-only workflow run without a global job role.
+        if not self.settings.job_role:
+            raise WorkflowError(
+                "AWS Batch requires a job role in the default (register-per-job) "
+                "mode: pass --aws-batch-job-role (or set "
+                "SNAKEMAKE_AWS_BATCH_JOB_ROLE) so it can be baked into each "
+                "registered job definition. It is only optional when you use a "
+                "pre-existing job definition (--aws-batch-job-definition or the "
+                "per-rule aws_batch_job_definition resource), which carries its "
+                "own role."
+            )
+
         job_uuid = str(uuid.uuid4())
         job_name = f"snakejob-{self.job.name}-{job_uuid}"
         job_definition_name = f"snakejob-def-{self.job.name}-{job_uuid}"

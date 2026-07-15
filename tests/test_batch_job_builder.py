@@ -1556,3 +1556,31 @@ class TestDeregisterSkipsPreexisting:
         executor = self._make_executor()
         executor._deregister_job(submitted)
         executor.batch_client.deregister_job_definition.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# Tests for the default-mode job-role requirement in build_job_definition
+# ---------------------------------------------------------------------------
+
+
+class TestBuildJobDefinitionJobRole:
+    """A job role is mandatory in the default (register-per-job) path.
+
+    Enforced here — not at global preflight — so a workflow driving pre-existing
+    definitions purely through the per-rule ``aws_batch_job_definition`` resource
+    (which is dispatched before ``build_job_definition``) can run without a
+    global job role.
+    """
+
+    def test_default_mode_requires_job_role(self):
+        builder = _make_builder()
+        builder.settings.job_role = None  # default mode, role forgotten
+        with pytest.raises(WorkflowError, match="requires a job role"):
+            builder.build_job_definition()
+
+    def test_default_mode_with_job_role_builds_definition(self):
+        builder = _make_builder()  # helper supplies a valid job_role
+        builder.job.resources = {"_cores": 1, "mem_mb": 2048}
+        job_def, job_name = builder.build_job_definition()
+        assert job_name.startswith("snakejob-test_rule-")
+        builder.batch_client.register_job_definition.assert_called_once()
