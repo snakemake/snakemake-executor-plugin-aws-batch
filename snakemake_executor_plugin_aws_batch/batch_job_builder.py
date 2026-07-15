@@ -1,6 +1,6 @@
 import os
 import uuid
-from typing import Any, List
+from typing import Any, List, Optional
 from botocore.exceptions import ClientError
 from snakemake_interface_common.exceptions import WorkflowError
 from snakemake_interface_executor_plugins.jobs import JobExecutorInterface
@@ -40,8 +40,27 @@ class BatchJobBuilder:
         self.job_queue = str(
             self.job.resources.get("batch_queue", self.settings.job_queue)
         )
-        # Determine platform from job queue
-        self.platform = self._get_platform_from_queue()
+        # Platform (EC2/FARGATE) is resolved lazily on first access. Pre-existing
+        # job definitions skip definition-building entirely, so they must not be
+        # forced to hold batch:DescribeJobQueues / DescribeComputeEnvironments
+        # permissions (the whole point of static definitions is a smaller IAM
+        # surface). Only the dynamic registration path touches `self.platform`.
+        self._platform: Optional[str] = None
+
+    @property
+    def platform(self) -> str:
+        """The queue's platform capability (EC2/FARGATE), resolved on first use.
+
+        Cached after the first lookup. Setting the attribute directly (e.g. in
+        tests) bypasses the queue query.
+        """
+        if self._platform is None:
+            self._platform = self._get_platform_from_queue()
+        return self._platform
+
+    @platform.setter
+    def platform(self, value: str) -> None:
+        self._platform = value
 
     def _make_container_command(self, remote_command: str) -> List[str]:
         """
@@ -267,30 +286,8 @@ class BatchJobBuilder:
 
         # Only include `timeout` when a timeout is explicitly set — omitting the
         # key means AWS Batch applies no timeout, which is the correct default for
-        # long-running bioinformatics workloads. The per-rule aws_batch_task_timeout
-        # resource takes precedence over the workflow-level task_timeout setting.
-        # When set, enforce the AWS minimum of 60 s locally so the error is clear
-        # rather than a Batch API rejection.
-        rule_timeout = self.job.resources.get("aws_batch_task_timeout")
-        if rule_timeout is not None:
-            task_timeout = rule_timeout
-            timeout_source = "aws_batch_task_timeout resource"
-        else:
-            task_timeout = self.settings.task_timeout
-            timeout_source = "--aws-batch-task-timeout"
-        if task_timeout is not None:
-            try:
-                task_timeout = int(task_timeout)
-            except (TypeError, ValueError) as e:
-                raise WorkflowError(
-                    f"Invalid {timeout_source} value {task_timeout!r}: "
-                    "must be an integer number of seconds (minimum 60)."
-                ) from e
-            if task_timeout < 60:
-                raise WorkflowError(
-                    f"{timeout_source} must be at least 60 seconds (AWS minimum), "
-                    f"got {task_timeout}."
-                )
+        # long-running bioinformatics workloads.
+        task_timeout = self._resolve_task_timeout()
         # Use the same validated, env-merged tag set as submit_job so the job
         # definition carries identical tags (each job registers its own
         # definition, so per-run cost-tracking tags apply to both).
@@ -363,7 +360,209 @@ class BatchJobBuilder:
 
         return tags
 
+    def _resolve_task_timeout(self) -> Optional[int]:
+        """Resolve the effective task timeout in seconds, or ``None``.
+
+        The per-rule ``aws_batch_task_timeout`` resource takes precedence over
+        the workflow-level ``task_timeout`` setting. Returns ``None`` when neither
+        is set so the ``timeout`` field can be omitted entirely (AWS Batch then
+        applies no timeout). Enforces the AWS minimum of 60 s locally so the error
+        is clear rather than a Batch API rejection. Raises ``WorkflowError`` for
+        non-integer or sub-minimum values.
+        """
+        rule_timeout = self.job.resources.get("aws_batch_task_timeout")
+        if rule_timeout is not None:
+            task_timeout = rule_timeout
+            timeout_source = "aws_batch_task_timeout resource"
+        else:
+            task_timeout = getattr(self.settings, "task_timeout", None)
+            timeout_source = "--aws-batch-task-timeout"
+        if task_timeout is None:
+            return None
+        try:
+            task_timeout = int(task_timeout)
+        except (TypeError, ValueError) as e:
+            raise WorkflowError(
+                f"Invalid {timeout_source} value {task_timeout!r}: "
+                "must be an integer number of seconds (minimum 60)."
+            ) from e
+        if task_timeout < 60:
+            raise WorkflowError(
+                f"{timeout_source} must be at least 60 seconds (AWS minimum), "
+                f"got {task_timeout}."
+            )
+        return task_timeout
+
+    def _resolve_scheduling_priority(self) -> Optional[int]:
+        """Resolve the effective scheduling priority override, or ``None``.
+
+        For fair-share queues. The per-rule ``aws_batch_scheduling_priority``
+        resource takes precedence over the workflow-level ``scheduling_priority``
+        setting. Returns ``None`` when neither is set so the
+        ``schedulingPriorityOverride`` kwarg can be omitted entirely — keeping
+        submissions byte-identical on non-fair-share queues. Raises
+        ``WorkflowError`` for non-integer or out-of-range values.
+        """
+        resource_priority = self.job.resources.get("aws_batch_scheduling_priority")
+        setting_priority = getattr(self.settings, "scheduling_priority", None)
+        if resource_priority is not None:
+            priority = resource_priority
+            priority_source = "aws_batch_scheduling_priority resource"
+        elif setting_priority is not None:
+            priority = setting_priority
+            priority_source = "--aws-batch-scheduling-priority setting"
+        else:
+            return None
+        try:
+            priority_int = int(priority)
+        except (TypeError, ValueError) as e:
+            raise WorkflowError(
+                f"Invalid {priority_source} {priority!r}: must be an integer."
+            ) from e
+        if not (0 <= priority_int <= 9999):
+            raise WorkflowError(
+                f"Invalid {priority_source} {priority_int}: "
+                "must be in range [0, 9999]."
+            )
+        return priority_int
+
+    def _resolve_preexisting_job_definition(self) -> Optional[str]:
+        """Return the effective pre-existing job definition name/ARN, or None.
+
+        Checks the per-rule ``aws_batch_job_definition`` resource first (mirrors
+        the ``batch_queue`` override pattern), then falls back to the
+        ``job_definition`` executor setting.  Returns ``None`` when neither is
+        set, which triggers the dynamic registration path.
+        """
+        per_rule = self.job.resources.get("aws_batch_job_definition")
+        if per_rule:
+            return str(per_rule)
+        return getattr(self.settings, "job_definition", None) or None
+
+    def _validate_preexisting_compatibility(self) -> None:
+        """Fail fast when settings that only make sense for dynamic definitions are set.
+
+        ``job_role`` is baked into the job definition at registration time and
+        cannot be overridden via ``containerOverrides``.  ``shared_memory_size_mb``
+        maps to ``linuxParameters.sharedMemorySize`` on the definition, not a
+        container override.  Both are silently useless in pre-existing mode, so we
+        raise early rather than silently ignore.
+
+        ``container_image`` cannot be distinguished from its default value so we
+        document in the setting help text that it is ignored and do not raise here.
+        """
+        if getattr(self.settings, "job_role", None):
+            raise WorkflowError(
+                "Cannot combine job_role (--aws-batch-job-role) with job_definition "
+                "(--aws-batch-job-definition): the job role is managed externally when "
+                "using a pre-existing job definition.  Remove --aws-batch-job-role or "
+                "omit --aws-batch-job-definition."
+            )
+        if self.job.resources.get("shared_memory_size_mb") is not None:
+            raise WorkflowError(
+                "Cannot combine the shared_memory_size_mb resource with "
+                "--aws-batch-job-definition: shared memory sizing is managed "
+                "externally when using a pre-existing job definition.  Remove the "
+                "shared_memory_size_mb resource or omit --aws-batch-job-definition."
+            )
+
+    def _submit_with_preexisting_definition(self, job_definition: str) -> dict:
+        """Submit a job using a pre-existing definition via containerOverrides.
+
+        Skips ``register_job_definition`` entirely.  Per-job specifics — command,
+        environment variables, vcpu/mem, and (when > 0) GPU — are passed through
+        ``containerOverrides`` so the definition's other settings remain in force.
+
+        Fargate/vcpu-mem constraint validation is intentionally skipped here:
+        the user-owned job definition already encodes the platform requirements,
+        and enforcing them here would duplicate logic that AWS validates at
+        submit time.
+
+        Returns the ``submit_job`` response dict with an extra
+        ``_preexisting_job_definition`` marker so ``_deregister_job`` knows to
+        skip deregistration.
+        """
+        self._validate_preexisting_compatibility()
+
+        job_uuid = str(uuid.uuid4())
+        job_name = f"snakejob-{self.job.name}-{job_uuid}"
+
+        gpu = max(0, int(self.job.resources.get("_gpus", 0)))
+        vcpu = max(
+            1,
+            (
+                self.job.threads
+                if self.job.threads > 0
+                else int(self.job.resources.get("_cores", 1))
+            ),
+        )
+        mem = max(1, int(self.job.resources.get("mem_mb", 1024)))
+
+        resource_requirements = [
+            {
+                "type": BATCH_JOB_RESOURCE_REQUIREMENT_TYPE.VCPU.value,
+                "value": str(vcpu),
+            },
+            {
+                "type": BATCH_JOB_RESOURCE_REQUIREMENT_TYPE.MEMORY.value,
+                "value": str(mem),
+            },
+        ]
+        if gpu > 0:
+            resource_requirements.append(
+                {
+                    "type": BATCH_JOB_RESOURCE_REQUIREMENT_TYPE.GPU.value,
+                    "value": str(gpu),
+                }
+            )
+
+        container_overrides: dict = {
+            "command": self._make_container_command(self.job_command),
+            "resourceRequirements": resource_requirements,
+        }
+        if self.envvars:
+            container_overrides["environment"] = [
+                {"name": k, "value": v} for k, v in self.envvars.items()
+            ]
+
+        job_params: dict = {
+            "jobName": job_name,
+            "jobQueue": self.job_queue,
+            "jobDefinition": job_definition,
+            "containerOverrides": container_overrides,
+        }
+
+        tags = self._build_job_tags()
+        if tags:
+            job_params["tags"] = tags
+
+        # Mirror the optional kwargs from the dynamic path. The dynamic path bakes
+        # the timeout into the registered definition; here we have no definition to
+        # register, so the timeout travels as SubmitJob's top-level `timeout`
+        # field, which overrides any timeout on the pre-existing definition.
+        # Scheduling priority applies equally to pre-existing definitions.
+        # NOTE: any future kwarg added to submit() (e.g. propagateTags) must also
+        # be mirrored here.
+        task_timeout = self._resolve_task_timeout()
+        if task_timeout is not None:
+            job_params["timeout"] = {"attemptDurationSeconds": task_timeout}
+
+        priority = self._resolve_scheduling_priority()
+        if priority is not None:
+            job_params["schedulingPriorityOverride"] = priority
+
+        try:
+            submitted = self.batch_client.submit_job(**job_params)
+            submitted["_preexisting_job_definition"] = True
+            return submitted
+        except Exception as e:
+            raise WorkflowError(f"Failed to submit job: {e}") from e
+
     def submit(self):
+        preexisting = self._resolve_preexisting_job_definition()
+        if preexisting:
+            return self._submit_with_preexisting_definition(preexisting)
+
         job_def, job_name = self.build_job_definition()
 
         job_params = {
@@ -378,35 +577,9 @@ class BatchJobBuilder:
         if tags:
             job_params["tags"] = tags
 
-        # Per-rule scheduling priority override for fair-share queues. The
-        # aws_batch_scheduling_priority resource takes precedence over the
-        # workflow-level scheduling_priority setting. When neither is set the
-        # kwarg is omitted entirely so submissions are byte-identical to today
-        # on non-fair-share queues.
-        resource_priority = self.job.resources.get("aws_batch_scheduling_priority")
-        setting_priority = getattr(self.settings, "scheduling_priority", None)
-        if resource_priority is not None:
-            priority = resource_priority
-            priority_source = "aws_batch_scheduling_priority resource"
-        elif setting_priority is not None:
-            priority = setting_priority
-            priority_source = "--aws-batch-scheduling-priority setting"
-        else:
-            priority = None
-            priority_source = ""
+        priority = self._resolve_scheduling_priority()
         if priority is not None:
-            try:
-                priority_int = int(priority)
-            except (TypeError, ValueError) as e:
-                raise WorkflowError(
-                    f"Invalid {priority_source} {priority!r}: must be an integer."
-                ) from e
-            if not (0 <= priority_int <= 9999):
-                raise WorkflowError(
-                    f"Invalid {priority_source} {priority_int}: "
-                    "must be in range [0, 9999]."
-                )
-            job_params["schedulingPriorityOverride"] = priority_int
+            job_params["schedulingPriorityOverride"] = priority
 
         try:
             submitted = self.batch_client.submit_job(**job_params)
