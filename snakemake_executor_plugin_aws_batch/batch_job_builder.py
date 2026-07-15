@@ -539,8 +539,9 @@ class BatchJobBuilder:
             # cost-allocation tags reach the actual compute layer. Without this,
             # tags are visible on the Batch job object but silently absent from the
             # ECS task that incurs the billed EC2/ECS spend.
-            # Note: ecs:TagResource may be required on the executor role depending
-            # on the account's ECS tag-authorization settings.
+            # Note: Batch tags the ECS task via its service role, so a custom Batch
+            # service role may need ecs:TagResource depending on the account's ECS
+            # tag-authorization settings.
             job_params["propagateTags"] = True
 
         # Mirror the optional kwargs from the dynamic path. The dynamic path bakes
@@ -585,8 +586,9 @@ class BatchJobBuilder:
             # cost-allocation tags reach the actual compute layer. Without this,
             # tags are visible on the Batch job object but silently absent from the
             # ECS task that incurs the billed EC2/ECS spend.
-            # Note: ecs:TagResource may be required on the executor role depending
-            # on the account's ECS tag-authorization settings.
+            # Note: Batch tags the ECS task via its service role, so a custom Batch
+            # service role may need ecs:TagResource depending on the account's ECS
+            # tag-authorization settings.
             job_params["propagateTags"] = True
 
         priority = self._resolve_scheduling_priority()

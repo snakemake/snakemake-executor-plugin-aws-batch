@@ -28,6 +28,114 @@ SNAKEMAKE_AWS_BATCH_REGION
 SNAKEMAKE_AWS_BATCH_JOB_QUEUE
 SNAKEMAKE_AWS_BATCH_JOB_ROLE
 
+# Required IAM permissions
+
+The principal that runs Snakemake (the *executor role*) needs the permissions
+below. They are grouped so you can grant only what your submission path uses: a
+small always-required core, an add-on for the default (dynamic) job-definition
+path, and an add-on for tags.
+
+## Always required
+
+```json
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "BatchCore",
+      "Effect": "Allow",
+      "Action": [
+        "batch:SubmitJob",
+        "batch:DescribeJobs",
+        "batch:TerminateJob"
+      ],
+      "Resource": "*"
+    }
+  ]
+}
+```
+
+These three actions are exercised on every submission path: the plugin submits
+each job, polls it with `DescribeJobs`, and terminates it on cancellation or
+shutdown.
+
+## Add-on: default (dynamic) job-definition path
+
+These permissions are used unless you point the plugin at a pre-existing job
+definition (`--aws-batch-job-definition` or the per-rule
+`aws_batch_job_definition` resource). On the default path the plugin inspects
+the queue, registers a job definition per job, and deregisters it afterwards; a
+pre-existing definition is submitted against directly with `containerOverrides`
+and needs none of these.
+
+```json
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "BatchDynamicJobDefinition",
+      "Effect": "Allow",
+      "Action": [
+        "batch:RegisterJobDefinition",
+        "batch:DeregisterJobDefinition",
+        "batch:DescribeJobQueues",
+        "batch:DescribeComputeEnvironments"
+      ],
+      "Resource": "*"
+    },
+    {
+      "Sid": "PassJobRole",
+      "Effect": "Allow",
+      "Action": "iam:PassRole",
+      "Resource": "arn:aws:iam::<account-id>:role/<job-role-name>"
+    }
+  ]
+}
+```
+
+- `batch:DescribeJobQueues` and `batch:DescribeComputeEnvironments` let the
+  plugin detect whether a queue is backed by EC2 or Fargate so it builds a
+  compatible job definition.
+- `batch:RegisterJobDefinition` and `batch:DeregisterJobDefinition` register the
+  per-job definition and deregister it afterwards.
+- The `PassJobRole` statement covers passing the job role (`--aws-batch-job-role`
+  / `SNAKEMAKE_AWS_BATCH_JOB_ROLE`) into the definition the plugin registers.
+  AWS enforces `iam:PassRole` where the role is supplied — at
+  `RegisterJobDefinition` — so it is only needed on this path, scoped to the
+  job-role ARN. The plugin refuses `--aws-batch-job-role` together with a
+  pre-existing definition: there the job role is baked into the definition by
+  whoever registered it (who needed `iam:PassRole` at that point), and the
+  executor never passes it, so `iam:PassRole` can be omitted. If a `SubmitJob`
+  is ever denied citing `iam:PassRole`, grant it scoped to the definition's role
+  ARN.
+
+## Add-on: tags (`--aws-batch-tags` or `SNAKEMAKE_AWS_BATCH_JOB_TAGS`)
+
+```json
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "BatchTagResource",
+      "Effect": "Allow",
+      "Action": "batch:TagResource",
+      "Resource": "*"
+    }
+  ]
+}
+```
+
+`batch:TagResource` authorizes the tag-on-create used when jobs and job
+definitions are submitted with tags; without it, submission fails with
+`AccessDenied` whenever tags are configured. When tags are set the plugin also
+enables `propagateTags` so the Batch job's tags reach the underlying ECS task,
+where the billed compute runs. AWS Batch creates and tags that ECS task itself,
+using its service role rather than the executor's credentials, so the executor
+role needs no ECS permissions. The AWS-managed service-linked role
+(`AWSServiceRoleForBatch`) already includes `ecs:TagResource`; if your compute
+environment uses a custom Batch service role and ECS tag authorization is
+enabled in your account, grant `ecs:TagResource` to that service role.
+
 # Rule-Specific Container Images
 
 By default, all jobs use the global container image specified via `--container-image`. However, you can specify a different container image for individual rules using the `aws_batch_container_image` resource parameter:
@@ -204,8 +312,10 @@ When tags are present the plugin also sets `propagateTags=True` on
 `submit_job` so that the tags reach the underlying ECS task. Without this,
 tags are visible on the Batch job object but absent from the ECS task that
 incurs the actual EC2/ECS spend, making them invisible in Cost Explorer.
-Depending on your account's ECS tag-authorization settings, `ecs:TagResource`
-may be required on the executor role for propagation to succeed.
+Batch tags the ECS task using its own service role, so if your compute
+environment uses a custom Batch service role and ECS tag authorization is
+enabled, that service role needs `ecs:TagResource` (see
+[Required IAM permissions](#required-iam-permissions)).
 
 # Pre-existing Job Definitions
 

@@ -59,8 +59,9 @@ class ExecutorSettings(ExecutorSettingsBase):
                 "The tags that should be applied to all of the batch tasks, "
                 "of the form KEY=VALUE. Tags are propagated to the underlying ECS "
                 "tasks so that cost-allocation tags reach the actual compute spend "
-                "in Cost Explorer. Note: ecs:TagResource may be required on the "
-                "executor role depending on account ECS tagging-authorization settings."
+                "in Cost Explorer. Note: a custom Batch service role may need "
+                "ecs:TagResource depending on account ECS tagging-authorization "
+                "settings."
             ),
             "env_var": False,
             "required": False,
