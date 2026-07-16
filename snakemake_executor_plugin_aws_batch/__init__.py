@@ -3,6 +3,7 @@ __copyright__ = "Copyright 2025, Snakemake community"
 __email__ = "jake.vancampen7@gmail.com"
 __license__ = "MIT"
 
+import os
 from dataclasses import dataclass, field
 from pprint import pformat
 from typing import List, AsyncGenerator, Optional
@@ -11,7 +12,10 @@ import boto3
 from botocore.exceptions import ClientError
 
 from snakemake_executor_plugin_aws_batch.batch_client import BatchClient
-from snakemake_executor_plugin_aws_batch.batch_job_builder import BatchJobBuilder
+from snakemake_executor_plugin_aws_batch.batch_job_builder import (
+    BatchJobBuilder,
+    SNAKEMAKE_AWS_BATCH_JOB_TAGS_ENV_VAR,
+)
 from snakemake_interface_executor_plugins.executors.base import SubmittedJobInfo
 from snakemake_interface_executor_plugins.executors.remote import RemoteExecutor
 from snakemake_interface_executor_plugins.settings import (
@@ -28,6 +32,18 @@ from snakemake_interface_common.exceptions import WorkflowError
 # prevent jobs from running. CREATING/UPDATING are transient and must NOT fail
 # the preflight check (a queue mid-update is recoverable), so only these abort.
 FATAL_BATCH_STATUSES = frozenset({"INVALID", "DELETING", "DELETED"})
+
+
+def _is_access_denied(error: ClientError) -> bool:
+    """True if a botocore ClientError is a permissions failure (vs. transient)."""
+    response = getattr(error, "response", {}) or {}
+    code = response.get("Error", {}).get("Code", "")
+    status = response.get("ResponseMetadata", {}).get("HTTPStatusCode")
+    return code in {
+        "AccessDenied",
+        "AccessDeniedException",
+        "UnauthorizedOperation",
+    } or status in (401, 403)
 
 
 # Optional:
@@ -362,6 +378,72 @@ class Executor(RemoteExecutor):
                 "environment(s)."
             )
         self._validate_job_role()
+        self._preflight_check_tags()
+
+    def _preflight_check_tags(self) -> None:
+        """Best-effort probe of ``batch:TagResource`` when tags are configured.
+
+        When tags are set (via ``--aws-batch-tags`` or the
+        ``SNAKEMAKE_AWS_BATCH_JOB_TAGS`` env var) every job is tagged at submit
+        time, so a missing ``batch:TagResource`` would otherwise surface as an
+        opaque ``AccessDenied`` an hour into the run. This runs a tag/untag
+        round-trip on the job queue ARN as a *proxy* for that permission and
+        fails fast if it is denied.
+
+        The probe is a heuristic, not a proof: jobs are tagged on the *job* and
+        *job-definition* resources (via ``submit_job`` / ``register_job_definition``),
+        not the queue, so an IAM policy that scopes ``batch:TagResource`` per
+        resource-type/ARN could grant it on the queue while denying it on the
+        job/job-definition resources (or the reverse). Treat a pass as "the
+        permission is very likely present" and a denial as "very likely
+        missing", not a guarantee either way.
+
+        Best-effort: only a permissions denial raises; any other error (or a
+        missing queue ARN / no tags configured) is a no-op. If the cleanup
+        untag fails, the throwaway ``snakemake-preflight`` tag is left on the
+        job queue (logged at debug) — so the round-trip is not guaranteed to be
+        fully non-destructive.
+        """
+        if not self._tags_configured():
+            return
+        queue_arn = getattr(self.settings, "job_queue", None)
+        if not queue_arn:
+            return
+
+        try:
+            self.batch_client.tag_resource(
+                resourceArn=queue_arn, tags={"snakemake-preflight": "1"}
+            )
+            # Clean up the throwaway tag; failure to untag is non-fatal.
+            try:
+                self.batch_client.untag_resource(
+                    resourceArn=queue_arn, tagKeys=["snakemake-preflight"]
+                )
+            except Exception as e:
+                self.logger.debug(
+                    "could not remove throwaway 'snakemake-preflight' tag from "
+                    f"the job queue (left in place): {e}"
+                )
+        except ClientError as e:
+            if _is_access_denied(e):
+                raise WorkflowError(
+                    "AWS Batch preflight check failed — the executor role was "
+                    "denied batch:TagResource on the job queue, but tags are "
+                    "configured. Job tagging at submit time would very likely "
+                    "fail with AccessDenied. Grant batch:TagResource (and "
+                    "ecs:TagResource if your account requires it) on the job / "
+                    "job-definition resources, or unset the tags."
+                ) from e
+            self.logger.debug(f"could not verify batch:TagResource: {e}")
+        except Exception as e:
+            self.logger.debug(f"could not verify batch:TagResource: {e}")
+
+    def _tags_configured(self) -> bool:
+        """True if any tags are set via the setting or the env var."""
+        settings_tags = getattr(self.settings, "tags", None)
+        if isinstance(settings_tags, dict) and settings_tags:
+            return True
+        return bool(os.environ.get(SNAKEMAKE_AWS_BATCH_JOB_TAGS_ENV_VAR, "").strip())
 
     def _queue_problems(self) -> Optional[List[str]]:
         """Return definitive job-queue / compute-environment misconfigurations.

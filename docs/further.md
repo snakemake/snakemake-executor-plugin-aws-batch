@@ -261,6 +261,19 @@ misconfiguration (a disabled/invalid queue or compute environment, `maxvCpus=0`,
 or a non-existent job role) fails fast with a clear error, so you don't wait for
 jobs that could never start.
 
+When tags are configured (via `--aws-batch-tags` or the
+`SNAKEMAKE_AWS_BATCH_JOB_TAGS` environment variable), the executor also runs a
+tag/untag round-trip on the job queue as a best-effort *proxy* for the
+`batch:TagResource` permission — otherwise a missing tag permission would only
+surface as an opaque `AccessDenied` at submission time. This probes the queue,
+whereas jobs are tagged on the job and job-definition resources, so an IAM
+policy that scopes `batch:TagResource` per resource cannot be fully verified
+this way — treat a pass or failure as a strong hint, not a guarantee. The check
+needs `batch:TagResource` and `batch:UntagResource` (and possibly
+`ecs:TagResource`, depending on your account's tag-authorization settings); if
+the cleanup untag is denied, the throwaway `snakemake-preflight` tag is left on
+the queue.
+
 The check is deliberately conservative about *uncertainty*: a transient API
 error, a queue mid-update (`status` `CREATING`/`UPDATING`), or a missing
 `batch:Describe*` / `iam:GetRole` permission is treated as a warning and the
