@@ -16,15 +16,24 @@ snakemake-interface-common = "^1.17.4"
 snakemake-interface-executor-plugins = "^9.3.2"
 snakemake-storage-plugin-s3 = ">=0.2,<0.4"
 
+[tool.poetry.scripts]
+# Opt-in launcher: submit a workflow's driver ("coordinator") as an AWS Batch
+# job and exit, instead of running the Snakemake scheduler locally.
+snakemake-aws-batch-coordinator = "snakemake_executor_plugin_aws_batch.coordinator:main"
+
 [tool.poetry.group.dev.dependencies]
 black = "^23.11.0"
 flake8 = "^6.1.0"
 coverage = "^7.3.2"
 pytest = "^7.4.3"
 snakemake = "^8.30.0"
+moto = {extras = ["batch", "s3"], version = "^5.0"}
 
 [tool.coverage.run]
-omit = [".*", "*/site-packages/*", "Snakefile"]
+# Snakefiles (Snakefile, *.smk) are Snakemake workflow files, not Python source
+# for coverage — omit them anywhere so `coverage report` never tries to parse a
+# workflow file that a test loaded (e.g. the coordinator's generated wrapper).
+omit = [".*", "*/site-packages/*", "Snakefile", "*/Snakefile", "*.smk"]
 
 [build-system]
 requires = ["poetry-core"]
