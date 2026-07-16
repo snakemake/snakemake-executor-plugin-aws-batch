@@ -21,7 +21,11 @@ black = "^23.11.0"
 flake8 = "^6.1.0"
 coverage = "^7.3.2"
 pytest = "^7.4.3"
-snakemake = "^8.30.0"
+# Support both snakemake 8 and 9. The executor talks to snakemake only through
+# snakemake-interface-executor-plugins (pinned in the runtime deps above), whose
+# contract is identical across 8 and 9, so no source changes are needed. CI's
+# testing matrix constrains this per leg to exercise both majors.
+snakemake = ">=8.30,<10"
 
 [tool.coverage.run]
 omit = [".*", "*/site-packages/*", "Snakefile"]
