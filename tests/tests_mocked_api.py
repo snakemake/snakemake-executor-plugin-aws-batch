@@ -15,6 +15,13 @@ class TestWorkflowsMocked(TestWorkflowsBase):
         return_value="EC2",
     )
     @patch(
+        # __post_init__ runs _preflight_validate(), which issues live
+        # describe_job_queues / iam:GetRole calls. Without AWS credentials (as in
+        # CI) these raise before any job runs, so short-circuit preflight here.
+        "snakemake_executor_plugin_aws_batch.Executor._preflight_validate",
+        return_value=None,
+    )
+    @patch(
         "snakemake_executor_plugin_aws_batch.batch_job_builder.BatchJobBuilder.submit",
         return_value={"jobName": "job_id", "jobId": "job_id", "jobQueue": "job_queue"},
     )
