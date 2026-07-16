@@ -28,6 +28,83 @@ SNAKEMAKE_AWS_BATCH_REGION
 SNAKEMAKE_AWS_BATCH_JOB_QUEUE
 SNAKEMAKE_AWS_BATCH_JOB_ROLE
 
+# Required IAM permissions
+
+The principal that runs Snakemake (the *executor role*) needs the following
+permissions to submit and monitor jobs. The policy is split into a mandatory
+core set and an add-on statement that is only needed when tags are configured.
+
+## Core policy (always required)
+
+```json
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "BatchCore",
+      "Effect": "Allow",
+      "Action": [
+        "batch:SubmitJob",
+        "batch:DescribeJobs",
+        "batch:RegisterJobDefinition",
+        "batch:DeregisterJobDefinition",
+        "batch:TerminateJob",
+        "batch:DescribeJobQueues",
+        "batch:DescribeComputeEnvironments"
+      ],
+      "Resource": "*"
+    },
+    {
+      "Sid": "PassJobRole",
+      "Effect": "Allow",
+      "Action": "iam:PassRole",
+      "Resource": "arn:aws:iam::<account-id>:role/<job-role-name>"
+    }
+  ]
+}
+```
+
+- `batch:DescribeJobQueues` and `batch:DescribeComputeEnvironments` detect
+  whether a queue is backed by EC2 or Fargate so the plugin builds a compatible
+  job definition. They are used only by the default register-per-job path; with
+  a pre-existing job definition (`--aws-batch-job-definition`) they can be
+  omitted too.
+- `batch:RegisterJobDefinition` and `batch:DeregisterJobDefinition` are only
+  needed when the plugin registers a job definition per job (the default). If
+  you use a pre-existing job definition (`--aws-batch-job-definition`), both can
+  be omitted — see [Pre-existing Job Definitions](#pre-existing-job-definitions).
+- The `PassJobRole` statement is required in the default (register-per-job)
+  mode: a job role is mandatory (`--aws-batch-job-role` /
+  `SNAKEMAKE_AWS_BATCH_JOB_ROLE`) and is baked into every registered job
+  definition, so `iam:PassRole` on that role is always exercised. It can be
+  omitted only when you use a pre-existing job definition
+  (`--aws-batch-job-definition`), where the plugin neither registers a
+  definition nor passes a role (the pre-existing definition carries its own
+  role). Scope its `Resource` to that specific job role ARN.
+
+## Add-on: tags (`--aws-batch-tags` or `SNAKEMAKE_AWS_BATCH_JOB_TAGS`)
+
+```json
+{
+  "Sid": "BatchTagResource",
+  "Effect": "Allow",
+  "Action": [
+    "batch:TagResource",
+    "batch:UntagResource"
+  ],
+  "Resource": "*"
+}
+```
+
+`batch:TagResource` authorizes the tag-on-create when jobs and job definitions
+are submitted with tags; without it, submission fails with `AccessDenied`
+whenever tags are configured. `batch:UntagResource` is used by the executor's
+startup tag-permission check, which does a tag/untag round-trip on the job queue
+to surface a missing `batch:TagResource` before jobs run; without it the
+throwaway preflight tag is left on the queue. Depending on your account's ECS
+tagging-authorization settings you may additionally need `ecs:TagResource` on
+`*`, because AWS Batch propagates tags to the ECS resources it manages.
+
 # Rule-Specific Container Images
 
 By default, all jobs use the global container image specified via `--container-image`. However, you can specify a different container image for individual rules using the `aws_batch_container_image` resource parameter:
