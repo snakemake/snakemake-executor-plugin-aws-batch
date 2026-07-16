@@ -3,6 +3,7 @@ __copyright__ = "Copyright 2025, Snakemake community"
 __email__ = "jake.vancampen7@gmail.com"
 __license__ = "MIT"
 
+import uuid
 from dataclasses import dataclass, field
 from pprint import pformat
 from typing import List, AsyncGenerator, Optional
@@ -11,7 +12,10 @@ import boto3
 from botocore.exceptions import ClientError
 
 from snakemake_executor_plugin_aws_batch.batch_client import BatchClient
-from snakemake_executor_plugin_aws_batch.batch_job_builder import BatchJobBuilder
+from snakemake_executor_plugin_aws_batch.batch_job_builder import (
+    BatchJobBuilder,
+    build_job_tags,
+)
 from snakemake_executor_plugin_aws_batch.constant import FATAL_BATCH_STATUSES
 from snakemake_interface_executor_plugins.executors.base import SubmittedJobInfo
 from snakemake_interface_executor_plugins.executors.remote import RemoteExecutor
@@ -23,6 +27,18 @@ from snakemake_interface_executor_plugins.jobs import (
     JobExecutorInterface,
 )
 from snakemake_interface_common.exceptions import WorkflowError
+
+
+def _is_access_denied(error: ClientError) -> bool:
+    """True if a botocore ClientError is a permissions failure (vs. transient)."""
+    response = getattr(error, "response", {}) or {}
+    code = response.get("Error", {}).get("Code", "")
+    status = response.get("ResponseMetadata", {}).get("HTTPStatusCode")
+    return code in {
+        "AccessDenied",
+        "AccessDeniedException",
+        "UnauthorizedOperation",
+    } or status in (401, 403)
 
 
 # Optional:
@@ -362,6 +378,103 @@ class Executor(RemoteExecutor):
                 "compute environment(s)."
             )
         self._validate_job_role()
+        self._preflight_check_tags()
+
+    def _preflight_check_tags(self) -> None:
+        """Best-effort probe of ``batch:TagResource`` when tags are configured.
+
+        When tags are set (via ``--aws-batch-tags`` or the
+        ``SNAKEMAKE_AWS_BATCH_JOB_TAGS`` env var) every job is tagged at submit
+        time, so a missing ``batch:TagResource`` would otherwise surface as an
+        opaque ``AccessDenied`` an hour into the run. This runs a tag/untag
+        round-trip on the job queue ARN as a *proxy* for that permission and
+        warns loudly if it is denied (it does not fail fast or raise).
+
+        The probe is a heuristic, not a proof: jobs are tagged on the *job* and
+        *job-definition* resources (via ``submit_job`` / ``register_job_definition``),
+        not the queue, so an IAM policy that scopes ``batch:TagResource`` per
+        resource-type/ARN could grant it on the queue while denying it on the
+        job/job-definition resources (or the reverse). Treat a pass as "the
+        permission is very likely present" and a denial as "very likely
+        missing", not a guarantee either way.
+
+        Best-effort: nothing here raises — a permissions denial is surfaced as
+        a warning, and any other error (or a missing queue ARN / no tags
+        configured) is a silent no-op. Each probe uses a unique
+        ``snakemake-preflight-<uuid>`` tag key so it never overwrites or deletes
+        a user-managed tag on the queue. If the cleanup untag fails, that
+        throwaway key is left on the job queue (logged at warning) — so the
+        round-trip is not guaranteed to be fully non-destructive.
+        """
+        if not self._tags_configured():
+            return
+        queue_arn = getattr(self.settings, "job_queue", None)
+        if not queue_arn:
+            return
+        if not queue_arn.startswith("arn:"):
+            # batch:TagResource requires a full ARN; a bare queue name (accepted
+            # elsewhere) cannot be probed, so skip rather than fail an ARN check.
+            self.logger.debug(
+                "skipping batch:TagResource preflight: job queue is not an ARN "
+                f"({queue_arn!r})"
+            )
+            return
+
+        # Use a unique key per probe so we never clobber or delete a
+        # user-managed tag that happens to share our prefix.
+        probe_key = f"snakemake-preflight-{uuid.uuid4().hex}"
+        try:
+            self.batch_client.tag_resource(resourceArn=queue_arn, tags={probe_key: "1"})
+            # Clean up the throwaway tag; failure to untag is non-fatal.
+            try:
+                self.batch_client.untag_resource(
+                    resourceArn=queue_arn, tagKeys=[probe_key]
+                )
+            except Exception as e:
+                # Warn (not debug): repeated cleanup failures accumulate stray
+                # probe tags on the queue. Still non-fatal — preflight never
+                # raises here.
+                self.logger.warning(
+                    f"could not remove throwaway {probe_key!r} tag from "
+                    f"the job queue (left in place): {e}"
+                )
+        except ClientError as e:
+            if _is_access_denied(e):
+                # A denial here is only a *hint* — the probe tags the queue, but
+                # jobs are tagged on the job / job-definition resources, so a
+                # per-resource-scoped policy could grant it there while denying
+                # it on the queue. Warn loudly (do not block a possibly-valid
+                # run), consistent with the rest of preflight's warn-on-
+                # uncertainty behavior.
+                self.logger.warning(
+                    "AWS Batch tag-permission preflight: the executor role was "
+                    f"denied batch:TagResource on the job queue ({queue_arn}), "
+                    "and tags are configured, so job tagging at submit time may "
+                    "fail with AccessDenied. This probe checks the queue as a "
+                    "proxy; a per-resource policy that grants batch:TagResource "
+                    "on the job / job-definition resources is fine. Otherwise "
+                    "grant it there (and ecs:TagResource if your account "
+                    "requires it), or unset the tags."
+                )
+            else:
+                self.logger.warning(
+                    f"could not verify batch:TagResource on the job queue: {e}"
+                )
+        except Exception as e:
+            self.logger.warning(
+                f"could not verify batch:TagResource on the job queue: {e}"
+            )
+
+    def _tags_configured(self) -> bool:
+        """True if any tags will actually be applied to submitted jobs.
+
+        Uses the authoritative :func:`build_job_tags` so the probe fires on
+        exactly the inputs that produce real tags — e.g. a separator-only env var
+        (``,,``) yields no tags and does not trigger it. A malformed tags env var
+        surfaces its ``WorkflowError`` here (at startup) rather than at the first
+        job build.
+        """
+        return bool(build_job_tags(self.settings))
 
     def _queue_problems(self) -> Optional[List[str]]:
         """Return definitive job-queue / compute-environment misconfigurations.

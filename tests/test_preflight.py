@@ -7,6 +7,7 @@ no-op on uncertain state (a transient API error or a missing describe/iam
 permission).
 """
 
+import os
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
@@ -14,7 +15,16 @@ import pytest
 from botocore.exceptions import ClientError
 from snakemake_interface_common.exceptions import WorkflowError
 
-from snakemake_executor_plugin_aws_batch import Executor
+from snakemake_executor_plugin_aws_batch import Executor, _is_access_denied
+from snakemake_executor_plugin_aws_batch.batch_job_builder import (
+    SNAKEMAKE_AWS_BATCH_JOB_TAGS_ENV_VAR,
+)
+
+
+def _env_without_tags() -> dict:
+    return {
+        k: v for k, v in os.environ.items() if k != SNAKEMAKE_AWS_BATCH_JOB_TAGS_ENV_VAR
+    }
 
 
 def _executor(**settings) -> Executor:
@@ -379,6 +389,132 @@ class TestPreflightValidate:
         ex._validate_job_role = MagicMock()
         ex._preflight_validate()  # must not raise
         ex._validate_job_role.assert_called_once()
+
+
+class TestPreflightCheckTags:
+    """The tag/untag round-trip that verifies batch:TagResource when tags are set."""
+
+    def _access_denied(self) -> ClientError:
+        return ClientError({"Error": {"Code": "AccessDenied"}}, "TagResource")
+
+    def test_no_tags_configured_skips(self):
+        ex = _executor()
+        with patch.dict(os.environ, _env_without_tags(), clear=True):
+            ex._preflight_check_tags()
+        ex.batch_client.tag_resource.assert_not_called()
+
+    def test_no_queue_skips(self):
+        ex = _executor(job_queue=None, tags={"Env": "prod"})
+        ex._preflight_check_tags()
+        ex.batch_client.tag_resource.assert_not_called()
+
+    def test_success_tags_then_untags(self):
+        ex = _executor(tags={"Env": "prod"})
+        ex._preflight_check_tags()  # must not raise
+        # Probe the configured queue ARN with a unique throwaway tag key, then
+        # remove that exact key.
+        ex.batch_client.tag_resource.assert_called_once()
+        tag_kwargs = ex.batch_client.tag_resource.call_args.kwargs
+        assert tag_kwargs["resourceArn"] == "arn:q"
+        probe_tags = tag_kwargs["tags"]
+        assert list(probe_tags.values()) == ["1"]
+        (probe_key,) = probe_tags.keys()
+        # A unique per-probe key so an existing user tag is never clobbered.
+        assert probe_key.startswith("snakemake-preflight-")
+        assert probe_key != "snakemake-preflight"
+        ex.batch_client.untag_resource.assert_called_once_with(
+            resourceArn="arn:q", tagKeys=[probe_key]
+        )
+
+    def test_separator_only_env_var_does_not_trigger_probe(self):
+        # A comma/whitespace-only env var yields no tags, so the live queue probe
+        # must not fire (predicate now matches the authoritative tag parser).
+        ex = _executor()
+        with patch.dict(
+            os.environ, {SNAKEMAKE_AWS_BATCH_JOB_TAGS_ENV_VAR: ", ,"}, clear=False
+        ):
+            ex._preflight_check_tags()
+        ex.batch_client.tag_resource.assert_not_called()
+
+    def test_malformed_tags_env_var_raises_at_preflight(self):
+        # A malformed env var (no '=') is rejected early at preflight via the
+        # shared build_job_tags parser, not silently at first job build.
+        ex = _executor()
+        with patch.dict(
+            os.environ, {SNAKEMAKE_AWS_BATCH_JOB_TAGS_ENV_VAR: "notapair"}, clear=False
+        ):
+            with pytest.raises(WorkflowError, match="malformed pair"):
+                ex._preflight_check_tags()
+
+    def test_bare_name_queue_skips_probe(self):
+        # batch:TagResource needs a full ARN; a bare queue name is skipped.
+        ex = _executor(job_queue="my-queue", tags={"Env": "prod"})
+        ex._preflight_check_tags()
+        ex.batch_client.tag_resource.assert_not_called()
+
+    def test_env_var_tags_trigger_check(self):
+        ex = _executor()
+        with patch.dict(
+            os.environ, {SNAKEMAKE_AWS_BATCH_JOB_TAGS_ENV_VAR: "Team=data"}
+        ):
+            ex._preflight_check_tags()
+        ex.batch_client.tag_resource.assert_called_once()
+
+    def test_missing_permission_warns_not_raises(self):
+        # A queue-tag denial is only a heuristic hint (the probe tags the queue,
+        # jobs are tagged on job/job-definition), so it warns loudly rather than
+        # blocking a possibly-valid run.
+        ex = _executor(tags={"Env": "prod"})
+        ex.batch_client.tag_resource.side_effect = self._access_denied()
+        ex._preflight_check_tags()  # must not raise
+        assert ex.logger.warning.called
+        warned = " ".join(str(c) for c in ex.logger.warning.call_args_list)
+        assert "batch:TagResource" in warned
+
+    def test_non_permission_error_degrades(self):
+        ex = _executor(tags={"Env": "prod"})
+        ex.batch_client.tag_resource.side_effect = ClientError(
+            {"Error": {"Code": "ThrottlingException"}}, "TagResource"
+        )
+        ex._preflight_check_tags()  # must not raise
+
+    @pytest.mark.parametrize("code", ["AccessDeniedException", "UnauthorizedOperation"])
+    def test_alternate_access_denied_codes_warn(self, code):
+        ex = _executor(tags={"Env": "prod"})
+        ex.batch_client.tag_resource.side_effect = ClientError(
+            {"Error": {"Code": code}}, "TagResource"
+        )
+        ex._preflight_check_tags()  # must not raise
+        assert ex.logger.warning.called
+
+    def test_http_forbidden_status_is_access_denied(self):
+        # A permissions failure signalled only by HTTP 403 (unrecognized code).
+        err = ClientError(
+            {
+                "Error": {"Code": "Forbidden"},
+                "ResponseMetadata": {"HTTPStatusCode": 403},
+            },
+            "TagResource",
+        )
+        assert _is_access_denied(err) is True
+
+    def test_untag_failure_is_non_fatal(self):
+        # Tag succeeds but the cleanup untag fails: must not raise. The stray
+        # snakemake-preflight-<uuid> tag is left behind and surfaced at warning
+        # (repeated failures accumulate queue metadata).
+        ex = _executor(tags={"Env": "prod"})
+        ex.batch_client.untag_resource.side_effect = Exception("no UntagResource")
+        ex._preflight_check_tags()  # must not raise
+        ex.batch_client.tag_resource.assert_called_once()
+        assert ex.logger.warning.called
+        warned = " ".join(str(c) for c in ex.logger.warning.call_args_list)
+        assert "snakemake-preflight-" in warned
+
+    def test_untag_not_called_when_tagging_denied(self):
+        ex = _executor(tags={"Env": "prod"})
+        ex.batch_client.tag_resource.side_effect = self._access_denied()
+        ex._preflight_check_tags()  # warns, does not raise
+        ex.batch_client.untag_resource.assert_not_called()
 
 
 class TestValidateJobRole:
