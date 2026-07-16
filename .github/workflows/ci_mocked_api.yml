@@ -70,6 +70,15 @@ jobs:
 
   testing:
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # Exercise both supported snakemake majors. The two legs resolve to the
+        # newest 8.x and 9.x, which pull different snakemake-interface-storage-
+        # plugins majors (3.x vs 4.x, via snakemake-storage-plugin-s3), so passing
+        # on one does not imply the other. The 8.x leg keeps the >=8.30 floor.
+        snakemake: [">=8.30,<9", ">=9,<10"]
+    name: testing (snakemake ${{ matrix.snakemake }})
     steps:
       - uses: actions/checkout@v3
 
@@ -80,8 +89,11 @@ jobs:
       - name: Install poetry
         run: pip install poetry
 
-      - name: Determine dependencies
-        run: poetry lock
+      - name: Constrain snakemake for this matrix leg
+        # A full re-resolve (not an overlay install) is required: the resolved
+        # snakemake release drives the snakemake-interface-storage-plugins major,
+        # which in turn pins a compatible snakemake-storage-plugin-s3 version.
+        run: poetry add --group dev --lock "snakemake@${{ matrix.snakemake }}"
 
       - uses: actions/setup-python@v4
         with:
@@ -90,7 +102,24 @@ jobs:
 
       - name: Install dependencies
         run: poetry install
-      
+
+      - name: Verify snakemake major matches the matrix leg
+        # Guard against a silent mis-resolution: fail loudly if the resolver ever
+        # selects the wrong major for a leg instead of passing green while testing
+        # the same major on both legs.
+        run: |
+          installed=$(poetry run python -c "import importlib.metadata as m; print(m.version('snakemake'))")
+          echo "resolved snakemake: $installed"
+          case "${{ matrix.snakemake }}" in
+            ">=8.30,<9") expected=8 ;;
+            ">=9,<10") expected=9 ;;
+            *) echo "::error::unhandled matrix leg '${{ matrix.snakemake }}'"; exit 1 ;;
+          esac
+          if [ "${installed%%.*}" != "$expected" ]; then
+            echo "::error::expected snakemake ${expected}.x for leg '${{ matrix.snakemake }}', got ${installed}"
+            exit 1
+          fi
+
       - name: Setup minio
         run: |
           docker run -d -p 9000:9000 --name minio \
