@@ -250,3 +250,98 @@ Task timeout and scheduling priority **are** still honored: `--aws-batch-task-ti
 resource) travel as `SubmitJob`'s top-level `timeout` and `schedulingPriorityOverride`
 fields, so they apply to pre-existing definitions just as they do to dynamically
 registered ones.
+
+# Coordinator Mode (opt-in)
+
+By default, the Snakemake **driver** (the scheduler that computes the DAG and
+submits/monitors worker jobs) runs **locally** — which ties your terminal or a
+login node to the whole workflow's lifetime. Coordinator mode is the **opt-in**
+alternative: it submits a single Batch job — the *coordinator* — whose command
+runs Snakemake in the cloud, then exits, so the local terminal can disconnect.
+The coordinator drives the workflow with the **full** Snakemake feature set
+(checkpoints, temp-file handling, live scheduling and retries) and submits worker
+jobs to Batch exactly as a local run would. Default behavior is unchanged; you
+opt in by using the launcher instead of running `snakemake` directly.
+
+## Usage
+
+```bash
+snakemake-aws-batch-coordinator \
+    --aws-batch-region us-east-1 \
+    --aws-batch-job-queue arn:aws:batch:...:job-queue/workers \
+    --aws-batch-job-role arn:aws:iam::...:role/snakemake-job-role \
+    --aws-batch-coordinator-queue arn:aws:batch:...:job-queue/coordinator-ondemand \
+    --default-storage-provider s3 \
+    --default-storage-prefix s3://my-bucket/prefix \
+    -- -s Snakefile my_target
+```
+
+Everything after `--` is your normal workflow invocation (snakefile, targets,
+config, ...). Monitor the run from the coordinator's Batch job (see
+*Observability* below). A few optional flags refine the run:
+
+- `--aws-batch-coordinator-status-prefix s3://…` — S3 base for the coordinator's
+  log, `.snakemake/` metadata, and a `status.json`, written per run under
+  `AWS_BATCH_JOB_ID`. Defaults to `<default-storage-prefix>/.coordinator`.
+- `--aws-batch-coordinator-notify-sns-topic arn:aws:sns:…` — publish a
+  completion/failure notification to this SNS topic.
+- `--aws-batch-container-image <image>` — the container image used to run
+  Snakemake. It is applied to **both** the coordinator job and the worker jobs
+  it submits, so the coordinator drives the workflow with the same image the
+  workers use.
+
+## How it works
+
+The launcher is intentionally built on **native** Snakemake — there is no
+scheduler hijack and no hard process exit:
+
+1. It writes a *wrapper* workflow that `include:`s your real workflow (so
+   Snakemake discovers and deploys its sources — snakefiles and scripts — with
+   the coordinator job) and defines a single **no-output** rule whose command
+   runs your real invocation in the cloud.
+2. It runs that wrapper with `--immediate-submit --notemp`, targeting only the
+   no-output rule. Snakemake natively submits the one job and exits **without
+   polling**; the no-output rule means no output verification on the
+   fire-and-forget coordinator job, and the included real rules are parsed but
+   not run locally.
+3. The coordinator job pulls the deployed sources from storage (the executor
+   sets `job_deploy_sources`) and runs the real workflow.
+
+The coordinator container must have `python` and `snakemake` on `PATH` with this
+plugin installed (the published runtime image satisfies this). Note that
+`include:`-ing your workflow means its top-level code (e.g. `configfile:`) is
+evaluated locally when the coordinator is submitted, so run the launcher from the
+workflow directory as you would `snakemake`.
+
+## Run the coordinator on on-demand capacity
+
+`--aws-batch-coordinator-queue` defaults to the worker `--aws-batch-job-queue`,
+but you should point it at an **on-demand** queue. Workers can be Spot (cheap,
+interruptible) because the coordinator resubmits them on interruption — but the
+coordinator itself is the driver, and a Spot reclaim of the coordinator tears
+down the whole run (its in-flight state lives in the container).
+
+## Observability and failure semantics
+
+Coordinator mode is *fire-and-forget*, so it changes what completion means:
+
+- **The local exit code means "coordinator submitted", not "workflow
+  succeeded".** Do not gate CI on it. Track the outcome via the coordinator's
+  Batch job status.
+- **Logs:** the coordinator job's Snakemake output streams to **CloudWatch Logs**
+  (`/aws/batch/job`) automatically, via Batch's default log driver — view it with
+  the console or `aws logs tail`.
+- **Durable log + metadata + notification:** the coordinator job runs Snakemake
+  through an in-job wrapper
+  (`snakemake_executor_plugin_aws_batch.coordinator_runner`) that, on exit,
+  uploads the driver log and the resume-relevant `.snakemake/` state
+  (`metadata/` and `incomplete/`; heavy caches and `locks/` are skipped) to the
+  status prefix on S3 and, if configured, publishes an SNS notification with the
+  outcome. Because that wrapper is the *parent* process, it survives an
+  inner-Snakemake crash or OOM and still records the result — only an
+  instance-level failure escapes it (another reason to run the coordinator on
+  on-demand).
+- **Recovery:** the synced `.snakemake/` and the durable outputs in S3 let a
+  re-run resume; provenance-based rerun triggers that depend on the ephemeral
+  metadata may still be lost. Prefer Batch `attempts=1` for the coordinator so a
+  failure surfaces rather than silently re-running with amnesia.
