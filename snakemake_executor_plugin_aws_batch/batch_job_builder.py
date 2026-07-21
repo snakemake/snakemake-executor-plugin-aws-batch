@@ -1,4 +1,5 @@
 import os
+import re
 import uuid
 from typing import Any, List, Optional
 from botocore.exceptions import ClientError
@@ -13,6 +14,46 @@ from snakemake_executor_plugin_aws_batch.constant import (
 )
 
 SNAKEMAKE_AWS_BATCH_JOB_TAGS_ENV_VAR = "SNAKEMAKE_AWS_BATCH_JOB_TAGS"
+
+# AWS Batch name constraints
+# Job names and job definition names must be <= 128 characters
+# Valid characters: letters, numbers, hyphens, and underscores
+AWS_BATCH_MAX_NAME_LENGTH = 128
+# UUID (36) + "snakejob-def-" (13) + "-" (1) = 50 chars overhead for job def name
+# Use 78 as max rule name length to accommodate both job and job def names
+MAX_RULE_NAME_LENGTH = 78
+# Suffix to indicate name was truncated (2 chars)
+TRUNCATION_SUFFIX = "-x"
+
+
+def _sanitize_job_name(name: str, max_length: int = MAX_RULE_NAME_LENGTH) -> str:
+    """Sanitize a job name for AWS Batch compatibility.
+
+    AWS Batch job names must:
+    - Be <= 128 characters total
+    - Contain only alphanumeric characters, hyphens, and underscores
+
+    When names exceed max_length, they are truncated and suffixed with "-x"
+    to indicate truncation occurred.
+
+    Args:
+        name: The raw job/rule name from Snakemake
+        max_length: Maximum length for the sanitized name portion
+
+    Returns:
+        Sanitized name safe for AWS Batch
+    """
+    # Replace invalid characters with underscores
+    sanitized = re.sub(r"[^a-zA-Z0-9_-]", "_", name)
+    # Collapse multiple underscores
+    sanitized = re.sub(r"_+", "_", sanitized)
+    # Strip leading/trailing underscores or hyphens
+    sanitized = sanitized.strip("_-")
+    # Truncate to max length, leaving room for truncation suffix
+    if len(sanitized) > max_length:
+        truncate_at = max_length - len(TRUNCATION_SUFFIX)
+        sanitized = sanitized[:truncate_at].rstrip("_-") + TRUNCATION_SUFFIX
+    return sanitized or "job"
 
 
 class BatchJobBuilder:
@@ -213,8 +254,9 @@ class BatchJobBuilder:
             )
 
         job_uuid = str(uuid.uuid4())
-        job_name = f"snakejob-{self.job.name}-{job_uuid}"
-        job_definition_name = f"snakejob-def-{self.job.name}-{job_uuid}"
+        sanitized_name = _sanitize_job_name(self.job.name)
+        job_name = f"snakejob-{sanitized_name}-{job_uuid}"
+        job_definition_name = f"snakejob-def-{sanitized_name}-{job_uuid}"
 
         # Validate and convert resources
         gpu = max(0, int(self.job.resources.get("_gpus", 0)))
@@ -485,7 +527,8 @@ class BatchJobBuilder:
         self._validate_preexisting_compatibility()
 
         job_uuid = str(uuid.uuid4())
-        job_name = f"snakejob-{self.job.name}-{job_uuid}"
+        sanitized_name = _sanitize_job_name(self.job.name)
+        job_name = f"snakejob-{sanitized_name}-{job_uuid}"
 
         gpu = max(0, int(self.job.resources.get("_gpus", 0)))
         vcpu = max(
