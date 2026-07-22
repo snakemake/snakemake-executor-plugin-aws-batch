@@ -1541,10 +1541,10 @@ class TestSanitizeJobName:
         """Names exceeding max length should be truncated with suffix."""
         long_name = "a" * 100
         result = _sanitize_job_name(long_name)
-        assert len(result) == MAX_RULE_NAME_LENGTH
-        # Should be truncated with suffix
+        # Truncated to max_length + suffix
+        assert len(result) == MAX_RULE_NAME_LENGTH + len(TRUNCATION_SUFFIX)
         assert result.endswith(TRUNCATION_SUFFIX)
-        expected = "a" * (MAX_RULE_NAME_LENGTH - len(TRUNCATION_SUFFIX)) + TRUNCATION_SUFFIX
+        expected = "a" * MAX_RULE_NAME_LENGTH + TRUNCATION_SUFFIX
         assert result == expected
 
     def test_truncation_strips_trailing_separator(self):
@@ -1552,7 +1552,7 @@ class TestSanitizeJobName:
         # Create a name that would have _ at truncation point
         name = "a" * 75 + "_b" * 20
         result = _sanitize_job_name(name)
-        assert len(result) <= MAX_RULE_NAME_LENGTH
+        assert len(result) <= MAX_RULE_NAME_LENGTH + len(TRUNCATION_SUFFIX)
         assert result.endswith(TRUNCATION_SUFFIX)
         # Check no trailing separator before the suffix
         without_suffix = result[:-len(TRUNCATION_SUFFIX)]
@@ -1584,6 +1584,6 @@ class TestSanitizeJobName:
         """Custom max_length parameter should be respected."""
         name = "abcdefghij"
         result = _sanitize_job_name(name, max_length=5)
-        # 5 - 2 (suffix) = 3 chars + suffix
-        assert result == "abc" + TRUNCATION_SUFFIX
-        assert len(result) == 5
+        # Result is max_length + suffix = 7 chars
+        assert result == "abcde" + TRUNCATION_SUFFIX
+        assert len(result) == 5 + len(TRUNCATION_SUFFIX)

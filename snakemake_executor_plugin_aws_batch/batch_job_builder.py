@@ -18,13 +18,15 @@ SNAKEMAKE_AWS_BATCH_JOB_TAGS_ENV_VAR = "SNAKEMAKE_AWS_BATCH_JOB_TAGS"
 # AWS Batch name constraints
 # Job names and job definition names must be <= 128 characters
 # Valid characters: letters, numbers, hyphens, and underscores
-  AWS_BATCH_MAX_NAME_LENGTH: int = 128
-  # UUID (36) + "snakejob-def-" (13) + "-" (1) = 50 chars overhead for job def name
-  _JOB_DEF_NAME_OVERHEAD: int = 50
-  # Max rule name length accommodates both job and job def names
-  MAX_RULE_NAME_LENGTH: int = AWS_BATCH_MAX_NAME_LENGTH - _JOB_DEF_NAME_OVERHEAD
+AWS_BATCH_MAX_NAME_LENGTH: int = 128
+# UUID (36) + "snakejob-def-" (13) + "-" (1) = 50 chars overhead for job def name
+_JOB_DEF_NAME_OVERHEAD: int = 50
 # Suffix to indicate name was truncated (2 chars)
-TRUNCATION_SUFFIX = "-x"
+TRUNCATION_SUFFIX: str = "-x"
+# Max rule name length accommodates both job and job def names plus truncation suffix
+MAX_RULE_NAME_LENGTH: int = (
+    AWS_BATCH_MAX_NAME_LENGTH - _JOB_DEF_NAME_OVERHEAD - len(TRUNCATION_SUFFIX)
+)  # 76
 
 
 def _sanitize_job_name(name: str, max_length: int = MAX_RULE_NAME_LENGTH) -> str:
@@ -44,17 +46,15 @@ def _sanitize_job_name(name: str, max_length: int = MAX_RULE_NAME_LENGTH) -> str
     Returns:
         Sanitized name safe for AWS Batch
     """
-    # Replace invalid characters with underscores
-      # Replace runs of invalid characters (and underscores) with a single underscore
-      sanitized = re.sub(r"[^a-zA-Z0-9-]+", "_", name)
-      # Strip leading/trailing underscores or hyphens
-      sanitized = sanitized.strip("_-")
+    # Replace runs of invalid characters (and underscores) with a single underscore
+    sanitized = re.sub(r"[^a-zA-Z0-9-]+", "_", name)
     # Strip leading/trailing underscores or hyphens
     sanitized = sanitized.strip("_-")
-    # Truncate to max length, leaving room for truncation suffix
+    # Strip leading/trailing underscores or hyphens
+    sanitized = sanitized.strip("_-")
+    # Truncate to max length and add suffix to indicate truncation
     if len(sanitized) > max_length:
-        truncate_at = max_length - len(TRUNCATION_SUFFIX)
-        sanitized = sanitized[:truncate_at].rstrip("_-") + TRUNCATION_SUFFIX
+        sanitized = sanitized[:max_length].rstrip("_-") + TRUNCATION_SUFFIX
     return sanitized or "job"
 
 
