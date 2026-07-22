@@ -18,10 +18,11 @@ SNAKEMAKE_AWS_BATCH_JOB_TAGS_ENV_VAR = "SNAKEMAKE_AWS_BATCH_JOB_TAGS"
 # AWS Batch name constraints
 # Job names and job definition names must be <= 128 characters
 # Valid characters: letters, numbers, hyphens, and underscores
-AWS_BATCH_MAX_NAME_LENGTH = 128
-# UUID (36) + "snakejob-def-" (13) + "-" (1) = 50 chars overhead for job def name
-# Use 78 as max rule name length to accommodate both job and job def names
-MAX_RULE_NAME_LENGTH = 78
+  AWS_BATCH_MAX_NAME_LENGTH: int = 128
+  # UUID (36) + "snakejob-def-" (13) + "-" (1) = 50 chars overhead for job def name
+  _JOB_DEF_NAME_OVERHEAD: int = 50
+  # Max rule name length accommodates both job and job def names
+  MAX_RULE_NAME_LENGTH: int = AWS_BATCH_MAX_NAME_LENGTH - _JOB_DEF_NAME_OVERHEAD
 # Suffix to indicate name was truncated (2 chars)
 TRUNCATION_SUFFIX = "-x"
 
