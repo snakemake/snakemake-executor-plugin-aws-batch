@@ -111,6 +111,18 @@ class BatchJobBuilder:
         """
         return ["/bin/bash", "-c", remote_command]
 
+    def _build_job_names(self) -> tuple[str, str]:
+        """Build sanitized job name and job definition name.
+
+        Returns:
+            A tuple of (job_name, job_definition_name) suitable for AWS Batch.
+        """
+        job_uuid = str(uuid.uuid4())
+        sanitized_name = _sanitize_job_name(self.job.name)
+        job_name = f"snakejob-{sanitized_name}-{job_uuid}"
+        job_definition_name = f"snakejob-def-{sanitized_name}-{job_uuid}"
+        return job_name, job_definition_name
+
     def _get_platform_from_queue(self) -> str:
         """
         Determine the platform (EC2 or FARGATE) from the job queue's
@@ -255,10 +267,7 @@ class BatchJobBuilder:
                 f"Use an EC2-backed AWS Batch queue instead."
             )
 
-        job_uuid = str(uuid.uuid4())
-        sanitized_name = _sanitize_job_name(self.job.name)
-        job_name = f"snakejob-{sanitized_name}-{job_uuid}"
-        job_definition_name = f"snakejob-def-{sanitized_name}-{job_uuid}"
+        job_name, job_definition_name = self._build_job_names()
 
         # Validate and convert resources
         gpu = max(0, int(self.job.resources.get("_gpus", 0)))
@@ -528,9 +537,7 @@ class BatchJobBuilder:
         """
         self._validate_preexisting_compatibility()
 
-        job_uuid = str(uuid.uuid4())
-        sanitized_name = _sanitize_job_name(self.job.name)
-        job_name = f"snakejob-{sanitized_name}-{job_uuid}"
+        job_name, _ = self._build_job_names()
 
         gpu = max(0, int(self.job.resources.get("_gpus", 0)))
         vcpu = max(
