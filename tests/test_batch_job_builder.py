@@ -1587,3 +1587,91 @@ class TestSanitizeJobName:
         # Result is max_length + suffix = 7 chars
         assert result == "abcde" + TRUNCATION_SUFFIX
         assert len(result) == 5 + len(TRUNCATION_SUFFIX)
+
+
+# ---------------------------------------------------------------------------
+# Tests for _build_job_names integration
+# ---------------------------------------------------------------------------
+
+
+class TestBuildJobNamesIntegration:
+    """Tests that build_job_definition and preexisting path use _sanitize_job_name."""
+
+    def _make_builder_with_name(self, job_name: str) -> BatchJobBuilder:
+        """Create a builder with a custom job name for testing sanitization."""
+        settings = SimpleNamespace(
+            job_queue="test-queue",
+            job_role="arn:aws:iam::123456789:role/test-role",
+            tags=None,
+            task_timeout=None,
+            job_definition=None,
+        )
+        batch_client = MagicMock()
+        batch_client.describe_job_queues.return_value = {"jobQueues": []}
+        batch_client.register_job_definition.return_value = {
+            "jobDefinitionName": "snakejob-def-test",
+            "revision": 1,
+        }
+
+        job = MagicMock()
+        job.name = job_name
+        job.threads = 1
+        job.resources = {"_cores": 1, "mem_mb": 1024}
+
+        builder = BatchJobBuilder(
+            logger=MagicMock(),
+            job=job,
+            envvars={},
+            container_image="test-image:latest",
+            settings=settings,
+            job_command="snakemake ...",
+            batch_client=batch_client,
+        )
+        # Force EC2 platform to avoid Fargate rejection
+        builder._platform = "EC2"
+        return builder
+
+    def test_build_job_definition_sanitizes_dotted_name(self):
+        """build_job_definition should sanitize job names with invalid characters."""
+        builder = self._make_builder_with_name("rule.with.dots")
+        job_def, job_name = builder.build_job_definition()
+
+        # Dots should be replaced with underscores
+        assert "." not in job_name
+        assert "rule_with_dots" in job_name
+        # Job definition name should also be sanitized
+        call_args = builder.batch_client.register_job_definition.call_args
+        job_def_name = call_args.kwargs["jobDefinitionName"]
+        assert "." not in job_def_name
+        assert "rule_with_dots" in job_def_name
+
+    def test_build_job_definition_sanitizes_long_name(self):
+        """build_job_definition should truncate overly long job names."""
+        long_name = "a" * 100
+        builder = self._make_builder_with_name(long_name)
+        job_def, job_name = builder.build_job_definition()
+
+        # Should be truncated with suffix
+        assert TRUNCATION_SUFFIX in job_name
+        # Total job name should fit AWS Batch limit (128 chars)
+        assert len(job_name) <= 128
+
+    def test_preexisting_path_sanitizes_dotted_name(self):
+        """_submit_with_preexisting_definition should sanitize job names."""
+        builder = self._make_builder_with_name("rule.with.dots")
+        # Remove job_role to avoid validation error in preexisting path
+        builder.settings.job_role = None
+        builder.batch_client.submit_job.return_value = {
+            "jobId": "test-job-id",
+            "jobName": "test-job-name",
+        }
+
+        result = builder._submit_with_preexisting_definition(
+            "arn:aws:batch:us-east-1:123456789:job-definition/my-def:1"
+        )
+
+        # Check the jobName passed to submit_job
+        call_args = builder.batch_client.submit_job.call_args
+        submitted_job_name = call_args.kwargs["jobName"]
+        assert "." not in submitted_job_name
+        assert "rule_with_dots" in submitted_job_name
