@@ -16,6 +16,9 @@ from snakemake_interface_common.exceptions import WorkflowError
 from snakemake_executor_plugin_aws_batch.batch_job_builder import (
     SNAKEMAKE_AWS_BATCH_JOB_TAGS_ENV_VAR,
     BatchJobBuilder,
+    _sanitize_job_name,
+    MAX_RULE_NAME_LENGTH,
+    TRUNCATION_SUFFIX,
 )
 from snakemake_executor_plugin_aws_batch.constant import (
     BATCH_JOB_PLATFORM_CAPABILITIES,
@@ -1498,3 +1501,177 @@ class TestDeregisterSkipsPreexisting:
         executor = self._make_executor()
         executor._deregister_job(submitted)
         executor.batch_client.deregister_job_definition.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# Tests for _sanitize_job_name
+# ---------------------------------------------------------------------------
+
+
+class TestSanitizeJobName:
+    """Tests for the _sanitize_job_name helper function."""
+
+    def test_simple_name_unchanged(self):
+        """Simple alphanumeric names should pass through unchanged."""
+        assert _sanitize_job_name("align") == "align"
+        assert _sanitize_job_name("my_rule") == "my_rule"
+        assert _sanitize_job_name("rule-name") == "rule-name"
+
+    def test_invalid_characters_replaced(self):
+        """Characters not allowed in AWS Batch names should be replaced."""
+        # Dots replaced with underscores
+        assert _sanitize_job_name("rule.name") == "rule_name"
+        # Colons replaced
+        assert _sanitize_job_name("rule:name") == "rule_name"
+        # Multiple invalid chars
+        assert _sanitize_job_name("a.b:c/d") == "a_b_c_d"
+
+    def test_multiple_underscores_collapsed(self):
+        """Multiple consecutive underscores should be collapsed to one."""
+        assert _sanitize_job_name("rule__name") == "rule_name"
+        assert _sanitize_job_name("a...b") == "a_b"
+
+    def test_leading_trailing_stripped(self):
+        """Leading and trailing underscores/hyphens should be stripped."""
+        assert _sanitize_job_name("_rule_") == "rule"
+        assert _sanitize_job_name("-rule-") == "rule"
+        assert _sanitize_job_name("__rule__") == "rule"
+
+    def test_truncation_at_max_length(self):
+        """Names exceeding max length should be truncated with suffix."""
+        long_name = "a" * 100
+        result = _sanitize_job_name(long_name)
+        # Truncated to max_length + suffix
+        assert len(result) == MAX_RULE_NAME_LENGTH + len(TRUNCATION_SUFFIX)
+        assert result.endswith(TRUNCATION_SUFFIX)
+        expected = "a" * MAX_RULE_NAME_LENGTH + TRUNCATION_SUFFIX
+        assert result == expected
+
+    def test_truncation_strips_trailing_separator(self):
+        """Truncation should not leave trailing underscores or hyphens before suffix."""
+        # Create a name that would have _ at truncation point
+        name = "a" * 75 + "_b" * 20
+        result = _sanitize_job_name(name)
+        assert len(result) <= MAX_RULE_NAME_LENGTH + len(TRUNCATION_SUFFIX)
+        assert result.endswith(TRUNCATION_SUFFIX)
+        # Check no trailing separator before the suffix
+        without_suffix = result[:-len(TRUNCATION_SUFFIX)]
+        assert not without_suffix.endswith("_")
+        assert not without_suffix.endswith("-")
+
+    def test_empty_name_returns_job(self):
+        """Empty or all-invalid names should return 'job' as fallback."""
+        assert _sanitize_job_name("") == "job"
+        assert _sanitize_job_name("...") == "job"
+        assert _sanitize_job_name("___") == "job"
+
+    def test_group_job_name_format(self):
+        """Test sanitization of typical GroupJob name format."""
+        # GroupJob.name format: "{groupid}_{rule1}_{rule2}_..."
+        group_name = "alignment_group_align_sort_index_mark_duplicates"
+        result = _sanitize_job_name(group_name)
+        assert result == group_name  # Should be unchanged if valid
+
+    def test_group_job_with_ellipsis(self):
+        """GroupJob names with '...' (from truncation) should be sanitized."""
+        # Snakemake adds '...' when >5 rules in group
+        name = "group_rule1_rule2_rule3_rule4_rule5_..."
+        result = _sanitize_job_name(name)
+        assert "..." not in result
+        assert "_" not in result[-1:]  # Should not end with _
+
+    def test_custom_max_length(self):
+        """Custom max_length parameter should be respected."""
+        name = "abcdefghij"
+        result = _sanitize_job_name(name, max_length=5)
+        # Result is max_length + suffix = 7 chars
+        assert result == "abcde" + TRUNCATION_SUFFIX
+        assert len(result) == 5 + len(TRUNCATION_SUFFIX)
+
+
+# ---------------------------------------------------------------------------
+# Tests for _build_job_names integration
+# ---------------------------------------------------------------------------
+
+
+class TestBuildJobNamesIntegration:
+    """Tests that build_job_definition and preexisting path use _sanitize_job_name."""
+
+    def _make_builder_with_name(self, job_name: str) -> BatchJobBuilder:
+        """Create a builder with a custom job name for testing sanitization."""
+        settings = SimpleNamespace(
+            job_queue="test-queue",
+            job_role="arn:aws:iam::123456789:role/test-role",
+            tags=None,
+            task_timeout=None,
+            job_definition=None,
+        )
+        batch_client = MagicMock()
+        batch_client.describe_job_queues.return_value = {"jobQueues": []}
+        batch_client.register_job_definition.return_value = {
+            "jobDefinitionName": "snakejob-def-test",
+            "revision": 1,
+        }
+
+        job = MagicMock()
+        job.name = job_name
+        job.threads = 1
+        job.resources = {"_cores": 1, "mem_mb": 1024}
+
+        builder = BatchJobBuilder(
+            logger=MagicMock(),
+            job=job,
+            envvars={},
+            container_image="test-image:latest",
+            settings=settings,
+            job_command="snakemake ...",
+            batch_client=batch_client,
+        )
+        # Force EC2 platform to avoid Fargate rejection
+        builder._platform = "EC2"
+        return builder
+
+    def test_build_job_definition_sanitizes_dotted_name(self):
+        """build_job_definition should sanitize job names with invalid characters."""
+        builder = self._make_builder_with_name("rule.with.dots")
+        job_def, job_name = builder.build_job_definition()
+
+        # Dots should be replaced with underscores
+        assert "." not in job_name
+        assert "rule_with_dots" in job_name
+        # Job definition name should also be sanitized
+        call_args = builder.batch_client.register_job_definition.call_args
+        job_def_name = call_args.kwargs["jobDefinitionName"]
+        assert "." not in job_def_name
+        assert "rule_with_dots" in job_def_name
+
+    def test_build_job_definition_sanitizes_long_name(self):
+        """build_job_definition should truncate overly long job names."""
+        long_name = "a" * 100
+        builder = self._make_builder_with_name(long_name)
+        job_def, job_name = builder.build_job_definition()
+
+        # Should be truncated with suffix
+        assert TRUNCATION_SUFFIX in job_name
+        # Total job name should fit AWS Batch limit (128 chars)
+        assert len(job_name) <= 128
+
+    def test_preexisting_path_sanitizes_dotted_name(self):
+        """_submit_with_preexisting_definition should sanitize job names."""
+        builder = self._make_builder_with_name("rule.with.dots")
+        # Remove job_role to avoid validation error in preexisting path
+        builder.settings.job_role = None
+        builder.batch_client.submit_job.return_value = {
+            "jobId": "test-job-id",
+            "jobName": "test-job-name",
+        }
+
+        result = builder._submit_with_preexisting_definition(
+            "arn:aws:batch:us-east-1:123456789:job-definition/my-def:1"
+        )
+
+        # Check the jobName passed to submit_job
+        call_args = builder.batch_client.submit_job.call_args
+        submitted_job_name = call_args.kwargs["jobName"]
+        assert "." not in submitted_job_name
+        assert "rule_with_dots" in submitted_job_name
