@@ -1584,9 +1584,9 @@ class TestSanitizeJobName:
         """Custom max_length parameter should be respected."""
         name = "abcdefghij"
         result = _sanitize_job_name(name, max_length=5)
-        # Result is max_length + suffix = 7 chars
-        assert result == "abcde" + TRUNCATION_SUFFIX
-        assert len(result) == 5 + len(TRUNCATION_SUFFIX)
+        # 5 - 2 (suffix) = 3 chars + suffix
+        assert result == "abc" + TRUNCATION_SUFFIX
+        assert len(result) == 5
 
 
 # ---------------------------------------------------------------------------
