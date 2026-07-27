@@ -48,8 +48,6 @@ def _sanitize_job_name(name: str, max_length: int = MAX_RULE_NAME_LENGTH) -> str
     sanitized = re.sub(r"[^a-zA-Z0-9-]+", "_", name)
     # Strip leading/trailing underscores or hyphens
     sanitized = sanitized.strip("_-")
-    # Strip leading/trailing underscores or hyphens
-    sanitized = sanitized.strip("_-")
     # Truncate to max length and add suffix to indicate truncation
     if len(sanitized) > max_length:
         sanitized = sanitized[:max_length].rstrip("_-") + TRUNCATION_SUFFIX
