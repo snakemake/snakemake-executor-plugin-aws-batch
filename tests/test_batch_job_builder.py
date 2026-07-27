@@ -1663,6 +1663,24 @@ class TestBuildJobNamesIntegration:
         assert job_def_name.startswith(f"snakejob-def-{expected_stem}-")
         assert len(job_def_name) <= AWS_BATCH_MAX_NAME_LENGTH
 
+    def test_build_job_definition_exact_max_length_passes(self):
+        """A rule name at exactly MAX_RULE_NAME_LENGTH should not be truncated."""
+        exact_name = "a" * MAX_RULE_NAME_LENGTH
+        builder = self._make_builder_with_name(exact_name)
+        job_def, job_name = builder.build_job_definition()
+
+        # Should NOT be truncated — no suffix appended
+        assert job_name.startswith(f"snakejob-{exact_name}-")
+        assert TRUNCATION_SUFFIX not in job_name
+        assert len(job_name) <= AWS_BATCH_MAX_NAME_LENGTH
+        # Job definition name should also pass without truncation
+        job_def_name = builder.batch_client.register_job_definition.call_args.kwargs[
+            "jobDefinitionName"
+        ]
+        assert job_def_name.startswith(f"snakejob-def-{exact_name}-")
+        assert TRUNCATION_SUFFIX not in job_def_name
+        assert len(job_def_name) <= AWS_BATCH_MAX_NAME_LENGTH
+
     def test_preexisting_path_sanitizes_dotted_name(self):
         """_submit_with_preexisting_definition should sanitize job names."""
         builder = self._make_builder_with_name("rule.with.dots")
