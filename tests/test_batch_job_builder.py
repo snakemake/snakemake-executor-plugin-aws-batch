@@ -1541,10 +1541,10 @@ class TestSanitizeJobName:
         """Names exceeding max length should be truncated with suffix."""
         long_name = "a" * 100
         result = _sanitize_job_name(long_name)
-        # Truncated to max_length + suffix
-        assert len(result) == MAX_RULE_NAME_LENGTH + len(TRUNCATION_SUFFIX)
+        assert len(result) == MAX_RULE_NAME_LENGTH
+        # Should be truncated with suffix
         assert result.endswith(TRUNCATION_SUFFIX)
-        expected = "a" * MAX_RULE_NAME_LENGTH + TRUNCATION_SUFFIX
+        expected = "a" * (MAX_RULE_NAME_LENGTH - len(TRUNCATION_SUFFIX)) + TRUNCATION_SUFFIX
         assert result == expected
 
     def test_truncation_strips_trailing_separator(self):
