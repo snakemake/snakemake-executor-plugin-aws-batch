@@ -50,7 +50,8 @@ def _sanitize_job_name(name: str, max_length: int = MAX_RULE_NAME_LENGTH) -> str
     sanitized = sanitized.strip("_-")
     # Truncate to max length and add suffix to indicate truncation
     if len(sanitized) > max_length:
-        sanitized = sanitized[:max_length].rstrip("_-") + TRUNCATION_SUFFIX
+        truncate_at = max_length - len(TRUNCATION_SUFFIX)
+        sanitized = sanitized[:truncate_at].rstrip("_-") + TRUNCATION_SUFFIX
     return sanitized or "job"
 
 
