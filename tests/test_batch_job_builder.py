@@ -1652,9 +1652,15 @@ class TestBuildJobNamesIntegration:
         job_def, job_name = builder.build_job_definition()
 
         # Should be truncated with suffix
-        assert TRUNCATION_SUFFIX in job_name
-        # Total job name should fit AWS Batch limit (128 chars)
-        assert len(job_name) <= 128
+        expected_stem = "a" * (MAX_RULE_NAME_LENGTH - len(TRUNCATION_SUFFIX)) + TRUNCATION_SUFFIX
+        assert job_name.startswith(f"snakejob-{expected_stem}-")
+        assert len(job_name) <= AWS_BATCH_MAX_NAME_LENGTH
+        # The job definition name is the binding constraint (longer prefix)
+        job_def_name = builder.batch_client.register_job_definition.call_args.kwargs[
+            "jobDefinitionName"
+        ]
+        assert job_def_name.startswith(f"snakejob-def-{expected_stem}-")
+        assert len(job_def_name) <= AWS_BATCH_MAX_NAME_LENGTH
 
     def test_preexisting_path_sanitizes_dotted_name(self):
         """_submit_with_preexisting_definition should sanitize job names."""
