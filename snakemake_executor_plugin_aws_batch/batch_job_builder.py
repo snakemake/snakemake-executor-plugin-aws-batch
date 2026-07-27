@@ -24,9 +24,7 @@ _JOB_DEF_NAME_OVERHEAD: int = 50
 # Suffix to indicate name was truncated (2 chars)
 TRUNCATION_SUFFIX: str = "-x"
 # Max rule name length accommodates both job and job def names plus truncation suffix
-MAX_RULE_NAME_LENGTH: int = (
-    AWS_BATCH_MAX_NAME_LENGTH - _JOB_DEF_NAME_OVERHEAD - len(TRUNCATION_SUFFIX)
-)  # 76
+MAX_RULE_NAME_LENGTH: int = AWS_BATCH_MAX_NAME_LENGTH - _JOB_DEF_NAME_OVERHEAD
 
 
 def _sanitize_job_name(name: str, max_length: int = MAX_RULE_NAME_LENGTH) -> str:
