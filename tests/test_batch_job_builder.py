@@ -19,6 +19,7 @@ from snakemake_executor_plugin_aws_batch.batch_job_builder import (
     _sanitize_job_name,
     MAX_RULE_NAME_LENGTH,
     TRUNCATION_SUFFIX,
+    AWS_BATCH_MAX_NAME_LENGTH,
 )
 from snakemake_executor_plugin_aws_batch.constant import (
     BATCH_JOB_PLATFORM_CAPABILITIES,
