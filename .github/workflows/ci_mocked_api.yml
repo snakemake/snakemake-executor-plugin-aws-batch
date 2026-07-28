@@ -70,6 +70,14 @@ jobs:
 
   testing:
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # Exercise both supported snakemake majors. The two legs resolve to
+        # different snakemake-interface-storage-plugins majors (3.x vs 4.x, via
+        # snakemake-storage-plugin-s3), so passing on one does not imply the other.
+        snakemake: ["<9", ">=9,<10"]
+    name: testing (snakemake ${{ matrix.snakemake }})
     steps:
       - uses: actions/checkout@v3
 
@@ -80,8 +88,11 @@ jobs:
       - name: Install poetry
         run: pip install poetry
 
-      - name: Determine dependencies
-        run: poetry lock
+      - name: Constrain snakemake for this matrix leg
+        # A full re-resolve (not an overlay install) is required: the snakemake
+        # major dictates the storage-interface major, which in turn pins a
+        # compatible snakemake-storage-plugin-s3 version.
+        run: poetry add --group dev --lock "snakemake@${{ matrix.snakemake }}"
 
       - uses: actions/setup-python@v4
         with:
