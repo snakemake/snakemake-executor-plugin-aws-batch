@@ -200,6 +200,13 @@ inherit the run-specific tags. AWS Batch allows at most 50 tags per job;
 malformed pairs (missing `=` or an empty key) raise an error at submission
 time.
 
+When tags are present the plugin also sets `propagateTags=True` on
+`submit_job` so that the tags reach the underlying ECS task. Without this,
+tags are visible on the Batch job object but absent from the ECS task that
+incurs the actual EC2/ECS spend, making them invisible in Cost Explorer.
+Depending on your account's ECS tag-authorization settings, `ecs:TagResource`
+may be required on the executor role for propagation to succeed.
+
 # Pre-existing Job Definitions
 
 By default the plugin registers a fresh AWS Batch job definition for every job

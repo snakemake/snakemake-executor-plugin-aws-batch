@@ -255,6 +255,35 @@ class TestSubmitTagPropagation:
         _, call_args = self._run_submit(builder)
         assert call_args.kwargs["jobQueue"] == "override-queue"
 
+    def test_propagate_tags_set_when_tags_present(self):
+        """propagateTags=True must be included in submit_job kwargs when tags exist."""
+        builder = _make_builder(tags={"Env": "prod"})
+        _, call_args = self._run_submit(builder)
+        assert _extract_propagate_tags(call_args) is True
+
+    def test_propagate_tags_set_when_only_env_var_tags(self):
+        """propagateTags=True must appear even when tags come only from the env var."""
+        builder = _make_builder(tags=None)
+        with patch.dict(
+            os.environ, {SNAKEMAKE_AWS_BATCH_JOB_TAGS_ENV_VAR: "Team=data"}
+        ):
+            _, call_args = self._run_submit(builder)
+        assert _extract_propagate_tags(call_args) is True
+
+    def test_propagate_tags_absent_when_no_tags(self):
+        """propagateTags must not appear in submit_job kwargs when there are no tags."""
+        builder = _make_builder(tags=None)
+        env = {
+            k: v
+            for k, v in os.environ.items()
+            if k != SNAKEMAKE_AWS_BATCH_JOB_TAGS_ENV_VAR
+        }
+        with patch.dict(os.environ, env, clear=True):
+            _, call_args = self._run_submit(builder)
+        # Assert key absence directly: an explicit propagateTags=None would also
+        # satisfy `.get(...) is None` but is not what we want to send to the SDK.
+        assert "propagateTags" not in call_args.kwargs
+
 
 def _extract_tags(call_args) -> dict | None:
     """Extract the 'tags' value from a mock call_args, or None if not present."""
@@ -263,6 +292,14 @@ def _extract_tags(call_args) -> dict | None:
         return None
     kwargs = call_args.kwargs if hasattr(call_args, "kwargs") else call_args[1]
     return kwargs.get("tags")
+
+
+def _extract_propagate_tags(call_args) -> bool | None:
+    """Extract the 'propagateTags' value from a mock call_args, or None if absent."""
+    if call_args is None:
+        return None
+    kwargs = call_args.kwargs if hasattr(call_args, "kwargs") else call_args[1]
+    return kwargs.get("propagateTags")
 
 
 # ---------------------------------------------------------------------------
@@ -1181,6 +1218,27 @@ class TestPreExistingJobDefinition:
         builder.submit()
         call_kwargs = builder.batch_client.submit_job.call_args.kwargs
         assert call_kwargs["tags"] == {"Env": "prod", "Project": "fgumi"}
+        # propagateTags must be mirrored here just like the dynamic path so the
+        # tags reach the underlying ECS task (see submit()).
+        assert call_kwargs["propagateTags"] is True
+
+    def test_propagate_tags_absent_in_preexisting_mode_when_no_tags(self):
+        """propagateTags must not appear when there are no tags in pre-existing mode."""
+        builder = _make_builder_with_preexisting(job_definition="my-job-def")
+        builder.settings.tags = None
+        builder.batch_client.submit_job.return_value = {
+            "jobName": "snakejob-test",
+            "jobId": "abc-123",
+        }
+        env = {
+            k: v
+            for k, v in os.environ.items()
+            if k != SNAKEMAKE_AWS_BATCH_JOB_TAGS_ENV_VAR
+        }
+        with patch.dict(os.environ, env, clear=True):
+            builder.submit()
+        call_kwargs = builder.batch_client.submit_job.call_args.kwargs
+        assert "propagateTags" not in call_kwargs
 
     def test_container_overrides_no_gpu_when_zero(self):
         """GPU must NOT appear in resourceRequirements when gpu == 0."""

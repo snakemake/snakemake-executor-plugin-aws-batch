@@ -535,14 +535,19 @@ class BatchJobBuilder:
         tags = self._build_job_tags()
         if tags:
             job_params["tags"] = tags
+            # Propagate tags from the Batch job to the underlying ECS task so that
+            # cost-allocation tags reach the actual compute layer. Without this,
+            # tags are visible on the Batch job object but silently absent from the
+            # ECS task that incurs the billed EC2/ECS spend.
+            # Note: ecs:TagResource may be required on the executor role depending
+            # on the account's ECS tag-authorization settings.
+            job_params["propagateTags"] = True
 
         # Mirror the optional kwargs from the dynamic path. The dynamic path bakes
         # the timeout into the registered definition; here we have no definition to
         # register, so the timeout travels as SubmitJob's top-level `timeout`
         # field, which overrides any timeout on the pre-existing definition.
         # Scheduling priority applies equally to pre-existing definitions.
-        # NOTE: any future kwarg added to submit() (e.g. propagateTags) must also
-        # be mirrored here.
         task_timeout = self._resolve_task_timeout()
         if task_timeout is not None:
             job_params["timeout"] = {"attemptDurationSeconds": task_timeout}
@@ -576,6 +581,13 @@ class BatchJobBuilder:
         tags = self._build_job_tags()
         if tags:
             job_params["tags"] = tags
+            # Propagate tags from the Batch job to the underlying ECS task so that
+            # cost-allocation tags reach the actual compute layer. Without this,
+            # tags are visible on the Batch job object but silently absent from the
+            # ECS task that incurs the billed EC2/ECS spend.
+            # Note: ecs:TagResource may be required on the executor role depending
+            # on the account's ECS tag-authorization settings.
+            job_params["propagateTags"] = True
 
         priority = self._resolve_scheduling_priority()
         if priority is not None:
