@@ -91,3 +91,21 @@ class BatchClient:
         :return: The response from the describe_compute_environments method.
         """
         return self.client.describe_compute_environments(**kwargs)
+
+    def tag_resource(self, **kwargs):
+        """
+        Add tags to an AWS Batch resource.
+
+        :param kwargs: The keyword arguments to pass to the tag_resource method.
+        :return: The response from the tag_resource method.
+        """
+        return self.client.tag_resource(**kwargs)
+
+    def untag_resource(self, **kwargs):
+        """
+        Remove tags from an AWS Batch resource.
+
+        :param kwargs: The keyword arguments to pass to the untag_resource method.
+        :return: The response from the untag_resource method.
+        """
+        return self.client.untag_resource(**kwargs)
