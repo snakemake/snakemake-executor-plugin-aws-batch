@@ -426,6 +426,17 @@ class BatchJobBuilder:
             )
         return priority_int
 
+    @property
+    def uses_preexisting_job_definition(self) -> bool:
+        """Whether this job submits against a pre-existing job definition.
+
+        ``True`` when a per-rule ``aws_batch_job_definition`` resource or the
+        ``job_definition`` executor setting is in effect. Callers use this to
+        preserve the smaller IAM surface of static definitions — the same reason
+        the dynamic-only platform lookup is skipped for them (see ``platform``).
+        """
+        return self._resolve_preexisting_job_definition() is not None
+
     def _resolve_preexisting_job_definition(self) -> Optional[str]:
         """Return the effective pre-existing job definition name/ARN, or None.
 

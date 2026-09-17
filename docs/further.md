@@ -368,25 +368,42 @@ resource) travel as `SubmitJob`'s top-level `timeout` and `schedulingPriorityOve
 fields, so they apply to pre-existing definitions just as they do to dynamically
 registered ones.
 
-# Preflight Validation
+# Job Role and Queue Validation
 
-At startup (before submitting any job) the executor sanity-checks the AWS Batch
-configuration so you don't wait on jobs that could never start. It verifies that
-the configured job queue is `ENABLED` and not in a failed/deleting state
-(`status` `INVALID`/`DELETING`/`DELETED`), that at least one of its compute
-environments is usable (`ENABLED`, not in a failed/deleting state, and
-`maxvCpus > 0` — AWS Batch falls back across the queue's
-`computeEnvironmentOrder`, so one healthy environment is enough), and — when
-`--aws-batch-job-role` is set and `iam:GetRole` is available — that the job role
-exists. A confirmed misconfiguration (a disabled/failed queue, a queue with no
-usable compute environment, or a non-existent job role) fails fast with a clear
-error.
+The executor sanity-checks the AWS Batch configuration so you don't wait on jobs
+that could never start, in two stages.
 
-The check is deliberately conservative about *uncertainty*: a transient API
+At startup (before submitting any job), and only when `--aws-batch-job-role` is
+set and `iam:GetRole` is available, it verifies that the job role exists. A
+confirmed-missing role fails fast with a clear error.
+
+Job-queue and compute-environment health is checked per **effective** queue at
+submission time, not at startup, because a rule can override the queue with the
+`batch_queue` resource — so validating only the global `--aws-batch-job-queue`
+at startup would both miss an unhealthy per-rule queue and wrongly reject a
+workflow that never submits to an unhealthy global one. The first time a job is
+submitted to a given queue, the executor verifies that the queue is `ENABLED`
+and not in a failed/deleting state (`status` `INVALID`/`DELETING`/`DELETED`) and
+that at least one of its compute environments is usable (`ENABLED`, not in a
+failed/deleting state, and `maxvCpus > 0` — AWS Batch falls back across the
+queue's `computeEnvironmentOrder`, so one healthy environment is enough). A
+confirmed misconfiguration (a disabled/failed queue, or a queue with no usable
+compute environment) fails fast before the job is submitted. Each distinct queue
+is checked once and the result cached, so a workflow that fans jobs across
+several queues validates every queue it uses without re-describing any of them.
+
+Jobs that submit against a **pre-existing job definition**
+(`--aws-batch-job-definition` or the per-rule `aws_batch_job_definition`
+resource) skip this queue check: like the platform lookup, it is deliberately
+omitted so those jobs keep the smaller IAM surface that static definitions are
+meant to provide (no `batch:DescribeJobQueues` /
+`batch:DescribeComputeEnvironments` required).
+
+Both checks are deliberately conservative about *uncertainty*: a transient API
 error, a queue mid-update (`status` `CREATING`/`UPDATING`), or a missing
 `iam:GetRole` permission is logged as a warning and the check is skipped rather
-than failing the workflow. It reuses the `batch:DescribeJobQueues` /
+than failing the workflow. The queue check reuses the `batch:DescribeJobQueues` /
 `batch:DescribeComputeEnvironments` permissions the executor already needs for
-platform detection (so a run missing those is not blocked by preflight, but will
+platform detection (so a run missing those is not blocked by validation, but will
 still fail later when the job definition is built), plus the optional
 `iam:GetRole` for the job-role check.

@@ -1059,6 +1059,9 @@ def _run_job_capture_container_image(
     executor.envvars = MagicMock(return_value={})
     executor.format_job_exec = MagicMock(return_value="snakemake ...")
     executor.report_job_submission = MagicMock()
+    # run_job validates the effective queue before submitting; that behavior is
+    # covered in tests/test_preflight.py, so stub it out here.
+    executor._validate_queue = MagicMock()
 
     job = MagicMock()
     job.resources = resources
@@ -1071,6 +1074,7 @@ def _run_job_capture_container_image(
             "jobQueue": "test-queue",
         }
         instance.job_queue = "test-queue"
+        instance.uses_preexisting_job_definition = False
         executor.run_job(job)
     return mock_cls.call_args.kwargs["container_image"]
 
