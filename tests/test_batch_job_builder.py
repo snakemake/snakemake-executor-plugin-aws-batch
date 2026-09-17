@@ -1603,7 +1603,9 @@ class TestSanitizeJobName:
         assert len(result) == MAX_RULE_NAME_LENGTH
         # Should be truncated with suffix
         assert result.endswith(TRUNCATION_SUFFIX)
-        expected = "a" * (MAX_RULE_NAME_LENGTH - len(TRUNCATION_SUFFIX)) + TRUNCATION_SUFFIX
+        expected = (
+            "a" * (MAX_RULE_NAME_LENGTH - len(TRUNCATION_SUFFIX)) + TRUNCATION_SUFFIX
+        )
         assert result == expected
 
     def test_truncation_strips_trailing_separator(self):
@@ -1614,7 +1616,7 @@ class TestSanitizeJobName:
         assert len(result) <= MAX_RULE_NAME_LENGTH + len(TRUNCATION_SUFFIX)
         assert result.endswith(TRUNCATION_SUFFIX)
         # Check no trailing separator before the suffix
-        without_suffix = result[:-len(TRUNCATION_SUFFIX)]
+        without_suffix = result[: -len(TRUNCATION_SUFFIX)]
         assert not without_suffix.endswith("_")
         assert not without_suffix.endswith("-")
 
@@ -1711,7 +1713,9 @@ class TestBuildJobNamesIntegration:
         job_def, job_name = builder.build_job_definition()
 
         # Should be truncated with suffix
-        expected_stem = "a" * (MAX_RULE_NAME_LENGTH - len(TRUNCATION_SUFFIX)) + TRUNCATION_SUFFIX
+        expected_stem = (
+            "a" * (MAX_RULE_NAME_LENGTH - len(TRUNCATION_SUFFIX)) + TRUNCATION_SUFFIX
+        )
         assert job_name.startswith(f"snakejob-{expected_stem}-")
         assert len(job_name) <= AWS_BATCH_MAX_NAME_LENGTH
         # The job definition name is the binding constraint (longer prefix)
@@ -1749,7 +1753,7 @@ class TestBuildJobNamesIntegration:
             "jobName": "test-job-name",
         }
 
-        result = builder._submit_with_preexisting_definition(
+        builder._submit_with_preexisting_definition(
             "arn:aws:batch:us-east-1:123456789:job-definition/my-def:1"
         )
 
