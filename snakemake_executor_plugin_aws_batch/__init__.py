@@ -3,11 +3,20 @@ __copyright__ = "Copyright 2025, Snakemake community"
 __email__ = "jake.vancampen7@gmail.com"
 __license__ = "MIT"
 
+import uuid
 from dataclasses import dataclass, field
 from pprint import pformat
 from typing import List, AsyncGenerator, Optional
+
+import boto3
+from botocore.exceptions import ClientError
+
 from snakemake_executor_plugin_aws_batch.batch_client import BatchClient
-from snakemake_executor_plugin_aws_batch.batch_job_builder import BatchJobBuilder
+from snakemake_executor_plugin_aws_batch.batch_job_builder import (
+    BatchJobBuilder,
+    build_job_tags,
+)
+from snakemake_executor_plugin_aws_batch.constant import FATAL_BATCH_STATUSES
 from snakemake_interface_executor_plugins.executors.base import SubmittedJobInfo
 from snakemake_interface_executor_plugins.executors.remote import RemoteExecutor
 from snakemake_interface_executor_plugins.settings import (
@@ -18,6 +27,18 @@ from snakemake_interface_executor_plugins.jobs import (
     JobExecutorInterface,
 )
 from snakemake_interface_common.exceptions import WorkflowError
+
+
+def _is_access_denied(error: ClientError) -> bool:
+    """True if a botocore ClientError is a permissions failure (vs. transient)."""
+    response = getattr(error, "response", {}) or {}
+    code = response.get("Error", {}).get("Code", "")
+    status = response.get("ResponseMetadata", {}).get("HTTPStatusCode")
+    return code in {
+        "AccessDenied",
+        "AccessDeniedException",
+        "UnauthorizedOperation",
+    } or status in (401, 403)
 
 
 # Optional:
@@ -161,6 +182,10 @@ class Executor(RemoteExecutor):
             self.batch_client = BatchClient(region_name=self.settings.region)
         except Exception as e:
             raise WorkflowError(f"Failed to initialize AWS Batch client: {e}") from e
+
+        # Fail fast on a definitively misconfigured queue/compute environment/role
+        # before submitting any jobs (degrades to a no-op if state is uncertain).
+        self._preflight_validate()
 
     def run_job(self, job: JobExecutorInterface):
         # Implement here how to run a job.
@@ -333,3 +358,265 @@ class Executor(RemoteExecutor):
         # cleanup jobs
         for j in active_jobs:
             self.cleanup_job_resources(j)
+
+    def _preflight_validate(self) -> None:
+        """Fail fast on a definitively misconfigured queue / compute env / role.
+
+        Best-effort about *uncertainty*: a transient API error or a missing
+        describe/iam permission degrades to a warning and the workflow proceeds.
+        Only a confirmed-bad configuration (disabled/invalid queue or compute
+        environment, ``maxvCpus=0``, or a non-existent job role) raises, before
+        any job is submitted.
+        """
+        problems = self._queue_problems()
+        if problems:
+            queue = getattr(self.settings, "job_queue", None)
+            raise WorkflowError(
+                "AWS Batch preflight check failed — jobs would never start: "
+                + "; ".join(problems)
+                + f". Check the configured --aws-batch-job-queue ({queue}) and its "
+                "compute environment(s)."
+            )
+        self._validate_job_role()
+        self._preflight_check_tags()
+
+    def _preflight_check_tags(self) -> None:
+        """Best-effort probe of ``batch:TagResource`` when tags are configured.
+
+        When tags are set (via ``--aws-batch-tags`` or the
+        ``SNAKEMAKE_AWS_BATCH_JOB_TAGS`` env var) every job is tagged at submit
+        time, so a missing ``batch:TagResource`` would otherwise surface as an
+        opaque ``AccessDenied`` an hour into the run. This runs a tag/untag
+        round-trip on the job queue ARN as a *proxy* for that permission and
+        warns loudly if it is denied (it does not fail fast or raise).
+
+        The probe is a heuristic, not a proof: jobs are tagged on the *job* and
+        *job-definition* resources (via ``submit_job`` / ``register_job_definition``),
+        not the queue, so an IAM policy that scopes ``batch:TagResource`` per
+        resource-type/ARN could grant it on the queue while denying it on the
+        job/job-definition resources (or the reverse). Treat a pass as "the
+        permission is very likely present" and a denial as "very likely
+        missing", not a guarantee either way.
+
+        Best-effort: nothing here raises — a permissions denial is surfaced as
+        a warning, and any other error (or a missing queue ARN / no tags
+        configured) is a silent no-op. Each probe uses a unique
+        ``snakemake-preflight-<uuid>`` tag key so it never overwrites or deletes
+        a user-managed tag on the queue. If the cleanup untag fails, that
+        throwaway key is left on the job queue (logged at warning) — so the
+        round-trip is not guaranteed to be fully non-destructive.
+        """
+        if not self._tags_configured():
+            return
+        queue_arn = getattr(self.settings, "job_queue", None)
+        if not queue_arn:
+            return
+        if not queue_arn.startswith("arn:"):
+            # batch:TagResource requires a full ARN; a bare queue name (accepted
+            # elsewhere) cannot be probed, so skip rather than fail an ARN check.
+            self.logger.debug(
+                "skipping batch:TagResource preflight: job queue is not an ARN "
+                f"({queue_arn!r})"
+            )
+            return
+
+        # Use a unique key per probe so we never clobber or delete a
+        # user-managed tag that happens to share our prefix.
+        probe_key = f"snakemake-preflight-{uuid.uuid4().hex}"
+        try:
+            self.batch_client.tag_resource(resourceArn=queue_arn, tags={probe_key: "1"})
+            # Clean up the throwaway tag; failure to untag is non-fatal.
+            try:
+                self.batch_client.untag_resource(
+                    resourceArn=queue_arn, tagKeys=[probe_key]
+                )
+            except Exception as e:
+                # Warn (not debug): repeated cleanup failures accumulate stray
+                # probe tags on the queue. Still non-fatal — preflight never
+                # raises here.
+                self.logger.warning(
+                    f"could not remove throwaway {probe_key!r} tag from "
+                    f"the job queue (left in place): {e}"
+                )
+        except ClientError as e:
+            if _is_access_denied(e):
+                # A denial here is only a *hint* — the probe tags the queue, but
+                # jobs are tagged on the job / job-definition resources, so a
+                # per-resource-scoped policy could grant it there while denying
+                # it on the queue. Warn loudly (do not block a possibly-valid
+                # run), consistent with the rest of preflight's warn-on-
+                # uncertainty behavior.
+                self.logger.warning(
+                    "AWS Batch tag-permission preflight: the executor role was "
+                    f"denied batch:TagResource on the job queue ({queue_arn}), "
+                    "and tags are configured, so job tagging at submit time may "
+                    "fail with AccessDenied. This probe checks the queue as a "
+                    "proxy; a per-resource policy that grants batch:TagResource "
+                    "on the job / job-definition resources is fine. Otherwise "
+                    "grant it there (and ecs:TagResource if your account "
+                    "requires it), or unset the tags."
+                )
+            else:
+                self.logger.warning(
+                    f"could not verify batch:TagResource on the job queue: {e}"
+                )
+        except Exception as e:
+            self.logger.warning(
+                f"could not verify batch:TagResource on the job queue: {e}"
+            )
+
+    def _tags_configured(self) -> bool:
+        """True if any tags will actually be applied to submitted jobs.
+
+        Uses the authoritative :func:`build_job_tags` so the probe fires on
+        exactly the inputs that produce real tags — e.g. a separator-only env var
+        (``,,``) yields no tags and does not trigger it. A malformed tags env var
+        surfaces its ``WorkflowError`` here (at startup) rather than at the first
+        job build.
+        """
+        return bool(build_job_tags(self.settings))
+
+    def _queue_problems(self) -> Optional[List[str]]:
+        """Return definitive job-queue / compute-environment misconfigurations.
+
+        Returns an empty list when everything looks healthy, a non-empty list of
+        problem descriptions when the queue or a compute environment is in a
+        state that would prevent jobs from ever starting (disabled/invalid,
+        ``maxvCpus=0``), or None when the state can't be determined (no queue
+        configured, or the queue describe itself failed — never block the
+        workflow on a transient failure or a missing describe permission).
+
+        The queue and compute-environment lookups fail independently: a failure
+        describing the compute environment(s) (e.g. a missing
+        ``batch:DescribeComputeEnvironments`` permission) still returns any
+        confirmed queue-level problems collected so far rather than discarding
+        them, so a definitively disabled/invalid queue is never masked by an
+        unrelated failure downstream.
+
+        Compute environments are judged collectively: AWS Batch falls back
+        across a queue's ``computeEnvironmentOrder``, so a compute-environment
+        problem is reported only when *every* attached environment is unusable —
+        one healthy environment is enough for jobs to run.
+        """
+        queue_arn = getattr(self.settings, "job_queue", None)
+        if not queue_arn:
+            return None
+        # If we can't even describe the queue, the state is unknown — degrade to
+        # a no-op rather than blocking the workflow on a transient failure or a
+        # missing batch:DescribeJobQueues permission.
+        try:
+            queues = self.batch_client.describe_job_queues(jobQueues=[queue_arn]).get(
+                "jobQueues", []
+            )
+        except Exception as e:
+            self.logger.warning(
+                f"skipping AWS Batch preflight check (could not check job queue): {e}"
+            )
+            return None
+        if not queues:
+            return ["job queue not found"]
+        jq = queues[0]
+        problems: List[str] = []
+        if jq.get("state") != "ENABLED":
+            problems.append(f"job queue is {jq.get('state')} (not ENABLED)")
+        if jq.get("status") in FATAL_BATCH_STATUSES:
+            problems.append(f"job queue status is {jq.get('status')}")
+        ce_arns = [
+            o.get("computeEnvironment") for o in jq.get("computeEnvironmentOrder", [])
+        ]
+        ce_arns = [c for c in ce_arns if c]
+        if ce_arns:
+            # A failure here must NOT discard the confirmed queue-level problems
+            # already collected above — return them instead of None.
+            try:
+                ces = self.batch_client.describe_compute_environments(
+                    computeEnvironments=ce_arns
+                ).get("computeEnvironments", [])
+            except Exception as e:
+                self.logger.warning(
+                    "could not check compute environment(s) during AWS Batch "
+                    f"preflight: {e}"
+                )
+                return problems
+            # AWS Batch tries a queue's compute environments in order and falls
+            # back to the next, so jobs are only definitively blocked when EVERY
+            # attached compute environment is unusable. Collect per-CE reasons
+            # but surface them only when none is usable — one healthy compute
+            # environment is enough for jobs to run.
+            ce_reasons: List[str] = []
+            any_usable = False
+            for ce in ces:
+                name = ce.get("computeEnvironmentName", "?")
+                reasons: List[str] = []
+                if ce.get("state") != "ENABLED":
+                    reasons.append(f"compute environment {name} is {ce.get('state')}")
+                if ce.get("status") in FATAL_BATCH_STATUSES:
+                    reasons.append(
+                        f"compute environment {name} status is {ce.get('status')}"
+                    )
+                if (ce.get("computeResources") or {}).get("maxvCpus") == 0:
+                    reasons.append(f"compute environment {name} has maxvCpus=0")
+                if reasons:
+                    ce_reasons.extend(reasons)
+                else:
+                    any_usable = True
+            if not any_usable:
+                # An empty ``ces`` here means the queue references compute
+                # environment(s) that a *successful* describe did not return —
+                # they no longer exist, so no job can start. Report the per-CE
+                # reasons when we have them, otherwise name the missing ARNs.
+                detail = (
+                    "; ".join(ce_reasons)
+                    if ce_reasons
+                    else "referenced compute environment(s) not found: "
+                    + ", ".join(ce_arns)
+                )
+                problems.append(
+                    "no usable compute environment on the job queue: " + detail
+                )
+        else:
+            # No compute environments attached. A regular ECS/EKS/ECS_FARGATE
+            # queue needs at least one, or no job can run — the builder would
+            # otherwise default to EC2 (see BatchJobBuilder) and submit into a
+            # queue that never dispatches. A SAGEMAKER_TRAINING service queue
+            # legitimately has none, but this executor submits
+            # compute-environment jobs, so it still can't run our workloads —
+            # flag it explicitly rather than mislabeling it "no compute env".
+            if jq.get("jobQueueType") == "SAGEMAKER_TRAINING":
+                problems.append(
+                    "job queue is a SAGEMAKER_TRAINING service queue; this "
+                    "executor submits compute-environment (ECS/EKS/Fargate) jobs "
+                    "and cannot use it"
+                )
+            else:
+                problems.append("job queue has no compute environments attached")
+        return problems
+
+    def _validate_job_role(self) -> None:
+        """Verify the configured job role exists (best-effort; needs iam:GetRole).
+
+        A confirmed-missing role (``NoSuchEntity``) fails fast; anything else
+        (most importantly a missing ``iam:GetRole`` permission) degrades silently
+        so the check never blocks a workflow on uncertainty.
+        """
+        role_arn = getattr(self.settings, "job_role", None)
+        if not role_arn or "/" not in role_arn:
+            return
+        # GetRole takes the bare role name, not the IAM path: for
+        # arn:aws:iam::<acct>:role/<path>/<name> the name is the final segment.
+        role_name = role_arn.rsplit("/", 1)[-1]
+        try:
+            boto3.client("iam", region_name=self.settings.region).get_role(
+                RoleName=role_name
+            )
+        except ClientError as e:
+            if e.response.get("Error", {}).get("Code") == "NoSuchEntity":
+                raise WorkflowError(
+                    f"Configured AWS Batch job role does not exist: {role_arn}"
+                ) from e
+            self.logger.warning(
+                "skipping AWS Batch job-role preflight check "
+                f"(likely missing iam:GetRole): {e}"
+            )
+        except Exception as e:
+            self.logger.warning(f"skipping AWS Batch job-role preflight check: {e}")

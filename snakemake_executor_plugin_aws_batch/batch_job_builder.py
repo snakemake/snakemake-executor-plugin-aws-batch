@@ -15,6 +15,56 @@ from snakemake_executor_plugin_aws_batch.constant import (
 SNAKEMAKE_AWS_BATCH_JOB_TAGS_ENV_VAR = "SNAKEMAKE_AWS_BATCH_JOB_TAGS"
 
 
+def build_job_tags(settings) -> dict:
+    """Merge the job tags from ``settings.tags`` and the env var.
+
+    Merges tags from ``settings.tags`` with those from the
+    ``SNAKEMAKE_AWS_BATCH_JOB_TAGS`` environment variable (comma-separated
+    ``KEY=VALUE`` pairs); env-var tags take precedence on key conflicts.
+
+    Malformed env input is rejected with a ``WorkflowError``: empty keys
+    (``=value``) and pairs without ``=`` (``value``). Empty pairs from trailing
+    or doubled commas are tolerated. AWS Batch caps a job at 50 tags; exceeding
+    that also raises locally so the job fails fast instead of at ``submit_job``
+    time. This is job-independent (it reads only ``settings`` and the env var),
+    so it can be reused both per-job and at preflight.
+
+    :param settings: the executor settings (must expose an optional ``tags``).
+    :return: merged tags dict (may be empty).
+    """
+    settings_tags = getattr(settings, "tags", None)
+    tags: dict = dict(settings_tags) if isinstance(settings_tags, dict) else {}
+    for key in tags:
+        if not key or not key.strip():
+            raise WorkflowError("Invalid tags in settings: tag key cannot be empty.")
+
+    env_tags_str = os.environ.get(SNAKEMAKE_AWS_BATCH_JOB_TAGS_ENV_VAR, "")
+    if env_tags_str:
+        for pair in env_tags_str.split(","):
+            pair = pair.strip()
+            if not pair:
+                # Tolerate trailing or doubled commas.
+                continue
+            if "=" not in pair:
+                raise WorkflowError(
+                    f"Invalid {SNAKEMAKE_AWS_BATCH_JOB_TAGS_ENV_VAR}: "
+                    f"malformed pair {pair!r} (expected KEY=VALUE)."
+                )
+            key, _, value = pair.partition("=")
+            key = key.strip()
+            if not key:
+                raise WorkflowError(
+                    f"Invalid {SNAKEMAKE_AWS_BATCH_JOB_TAGS_ENV_VAR}: "
+                    "tag key cannot be empty."
+                )
+            tags[key] = value.strip()
+
+    if len(tags) > 50:
+        raise WorkflowError(f"AWS Batch jobs support at most 50 tags, got {len(tags)}.")
+
+    return tags
+
+
 class BatchJobBuilder:
     def __init__(
         self,
@@ -309,56 +359,8 @@ class BatchJobBuilder:
             raise WorkflowError(f"Failed to register job definition: {e}") from e
 
     def _build_job_tags(self) -> dict:
-        """Build the tags dict for job submission.
-
-        Merges tags from settings with those from the SNAKEMAKE_AWS_BATCH_JOB_TAGS
-        environment variable (comma-separated KEY=VALUE pairs). Environment variable
-        tags take precedence over settings tags on key conflicts.
-
-        Malformed env input is rejected with a WorkflowError: empty keys
-        (``=value``) and pairs without ``=`` (``value``). Empty pairs from
-        trailing or doubled commas are tolerated. AWS Batch caps a job at 50
-        tags; exceeding that also raises locally so the job fails fast
-        instead of at submit_job time.
-
-        :return: Merged tags dict (may be empty).
-        """
-        tags: dict = (
-            dict(self.settings.tags) if isinstance(self.settings.tags, dict) else {}
-        )
-        for key in tags:
-            if not key or not key.strip():
-                raise WorkflowError(
-                    "Invalid tags in settings: tag key cannot be empty."
-                )
-
-        env_tags_str = os.environ.get(SNAKEMAKE_AWS_BATCH_JOB_TAGS_ENV_VAR, "")
-        if env_tags_str:
-            for pair in env_tags_str.split(","):
-                pair = pair.strip()
-                if not pair:
-                    # Tolerate trailing or doubled commas.
-                    continue
-                if "=" not in pair:
-                    raise WorkflowError(
-                        f"Invalid {SNAKEMAKE_AWS_BATCH_JOB_TAGS_ENV_VAR}: "
-                        f"malformed pair {pair!r} (expected KEY=VALUE)."
-                    )
-                key, _, value = pair.partition("=")
-                key = key.strip()
-                if not key:
-                    raise WorkflowError(
-                        f"Invalid {SNAKEMAKE_AWS_BATCH_JOB_TAGS_ENV_VAR}: "
-                        "tag key cannot be empty."
-                    )
-                tags[key] = value.strip()
-
-        if len(tags) > 50:
-            raise WorkflowError(
-                f"AWS Batch jobs support at most 50 tags, got {len(tags)}."
-            )
-
-        return tags
+        """Build the merged tags dict for this job (see :func:`build_job_tags`)."""
+        return build_job_tags(self.settings)
 
     def _resolve_task_timeout(self) -> Optional[int]:
         """Resolve the effective task timeout in seconds, or ``None``.

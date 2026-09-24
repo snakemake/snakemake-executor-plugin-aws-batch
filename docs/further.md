@@ -305,8 +305,8 @@ Environment variable tags are merged with `--aws-batch-tags` and take
 precedence on key conflicts. This enables per-run cost tracking: a
 coordinator job can set the variable so that all child jobs it submits
 inherit the run-specific tags. AWS Batch allows at most 50 tags per job;
-malformed pairs (missing `=` or an empty key) raise an error at submission
-time.
+malformed pairs (missing `=` or an empty key) raise an error at startup,
+during the preflight check, before any job is submitted.
 
 When tags are present the plugin also sets `propagateTags=True` on
 `submit_job` so that the tags reach the underlying ECS task. Without this,
@@ -367,3 +367,40 @@ Task timeout and scheduling priority **are** still honored: `--aws-batch-task-ti
 resource) travel as `SubmitJob`'s top-level `timeout` and `schedulingPriorityOverride`
 fields, so they apply to pre-existing definitions just as they do to dynamically
 registered ones.
+
+# Preflight Validation
+
+At startup (before submitting any job) the executor sanity-checks the AWS Batch
+configuration so you don't wait on jobs that could never start. It verifies that
+the configured job queue is `ENABLED` and not in a failed/deleting state
+(`status` `INVALID`/`DELETING`/`DELETED`), that at least one of its compute
+environments is usable (`ENABLED`, not in a failed/deleting state, and
+`maxvCpus > 0` — AWS Batch falls back across the queue's
+`computeEnvironmentOrder`, so one healthy environment is enough), and — when
+`--aws-batch-job-role` is set and `iam:GetRole` is available — that the job role
+exists. A confirmed misconfiguration (a disabled/failed queue, a queue with no
+usable compute environment, or a non-existent job role) fails fast with a clear
+error.
+
+The check is deliberately conservative about *uncertainty*: a transient API
+error, a queue mid-update (`status` `CREATING`/`UPDATING`), or a missing
+`iam:GetRole` permission is logged as a warning and the check is skipped rather
+than failing the workflow. It reuses the `batch:DescribeJobQueues` /
+`batch:DescribeComputeEnvironments` permissions the executor already needs for
+platform detection (so a run missing those is not blocked by preflight, but will
+still fail later when the job definition is built), plus the optional
+`iam:GetRole` for the job-role check.
+
+When tags are configured (via `--aws-batch-tags` or the
+`SNAKEMAKE_AWS_BATCH_JOB_TAGS` environment variable), the executor additionally
+runs a tag/untag round-trip on the job queue as a best-effort *proxy* for the
+`batch:TagResource` permission, so a missing permission surfaces as a warning at
+startup rather than only as an opaque `AccessDenied` an hour into the run. It
+probes the queue, whereas jobs are tagged on the job and job-definition
+resources, so an IAM policy that scopes `batch:TagResource` per resource cannot
+be fully verified this way — a denial is therefore logged as a warning (it does
+**not** block the run) and a pass is a strong hint, not a guarantee. The probe
+needs `batch:TagResource` (and `batch:UntagResource` to remove the throwaway
+`snakemake-preflight` tag it writes; if that cleanup untag is denied, the tag is
+left on the queue). Depending on your account's tag-authorization settings you
+may additionally need `ecs:TagResource`.
