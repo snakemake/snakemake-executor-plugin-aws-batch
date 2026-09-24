@@ -327,6 +327,11 @@ infrastructure tooling (Terraform, CloudFormation) can opt out of this with
 with the supplied definition, pushing per-job specifics (command, environment
 variables, vcpu/mem/gpu) through `containerOverrides`.
 
+Because the pre-existing definition supplies its own role, `--aws-batch-job-role`
+is **not required** in this mode (it *is* required in the default register-per-job
+mode). Providing it alongside `--aws-batch-job-definition` is rejected — see
+*Incompatible combinations* below.
+
 ```bash
 snakemake --executor aws-batch \
     --aws-batch-job-definition my-snakemake-def:3 \
@@ -347,15 +352,17 @@ rule align:
     ...
 ```
 
-**Incompatible combinations** — the following raise a `WorkflowError` at
-submission time because they are only meaningful when the plugin builds the
+**Incompatible combinations** — the following are rejected with a
+`WorkflowError` because they are only meaningful when the plugin builds the
 definition:
 
 - `--aws-batch-job-role` (`job_role`): the job role is baked into the
   definition at registration time and cannot be overridden via
-  `containerOverrides`.
+  `containerOverrides`. Combined with the global `--aws-batch-job-definition` it
+  is rejected at **startup** (preflight); combined with a per-rule
+  `aws_batch_job_definition` resource it is rejected when that job is submitted.
 - The per-rule `shared_memory_size_mb` resource: `linuxParameters.sharedMemorySize`
-  is a definition-level field.
+  is a definition-level field (rejected at job submission).
 
 The `--aws-batch-container-image` (`container_image`) setting and the per-rule
 `aws_batch_container_image` resource are both silently ignored in this mode — the
@@ -367,3 +374,26 @@ Task timeout and scheduling priority **are** still honored: `--aws-batch-task-ti
 resource) travel as `SubmitJob`'s top-level `timeout` and `schedulingPriorityOverride`
 fields, so they apply to pre-existing definitions just as they do to dynamically
 registered ones.
+
+# Preflight Validation
+
+At startup (before submitting any job) the executor sanity-checks the AWS Batch
+configuration so you don't wait on jobs that could never start. It verifies that
+the configured job queue is `ENABLED` and not in a failed/deleting state
+(`status` `INVALID`/`DELETING`/`DELETED`), that at least one of its compute
+environments is usable (`ENABLED`, not in a failed/deleting state, and
+`maxvCpus > 0` — AWS Batch falls back across the queue's
+`computeEnvironmentOrder`, so one healthy environment is enough), and — when
+`--aws-batch-job-role` is set and `iam:GetRole` is available — that the job role
+exists. A confirmed misconfiguration (a disabled/failed queue, a queue with no
+usable compute environment, or a non-existent job role) fails fast with a clear
+error.
+
+The check is deliberately conservative about *uncertainty*: a transient API
+error, a queue mid-update (`status` `CREATING`/`UPDATING`), or a missing
+`iam:GetRole` permission is logged as a warning and the check is skipped rather
+than failing the workflow. It reuses the `batch:DescribeJobQueues` /
+`batch:DescribeComputeEnvironments` permissions the executor already needs for
+platform detection (so a run missing those is not blocked by preflight, but will
+still fail later when the job definition is built), plus the optional
+`iam:GetRole` for the job-role check.
