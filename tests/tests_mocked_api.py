@@ -15,6 +15,22 @@ class TestWorkflowsMocked(TestWorkflowsBase):
         return_value="EC2",
     )
     @patch(
+        # __post_init__ runs _preflight_validate(), which issues live
+        # describe_job_queues / iam:GetRole calls. Those are irrelevant to these
+        # workflow-level tests and have no credentials in CI (where they would
+        # degrade to a warning, not raise), so short-circuit preflight here — its
+        # own behavior is covered by tests/test_preflight.py.
+        "snakemake_executor_plugin_aws_batch.Executor._preflight_validate",
+        return_value=None,
+    )
+    @patch(
+        # run_job validates the effective queue before submitting via a live
+        # describe_job_queues call; short-circuit it here for the same reason as
+        # preflight (covered by tests/test_preflight.py).
+        "snakemake_executor_plugin_aws_batch.Executor._validate_queue",
+        return_value=None,
+    )
+    @patch(
         "snakemake_executor_plugin_aws_batch.batch_job_builder.BatchJobBuilder.submit",
         return_value={"jobName": "job_id", "jobId": "job_id", "jobQueue": "job_queue"},
     )

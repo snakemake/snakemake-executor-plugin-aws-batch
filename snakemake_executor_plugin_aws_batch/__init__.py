@@ -5,9 +5,14 @@ __license__ = "MIT"
 
 from dataclasses import dataclass, field
 from pprint import pformat
-from typing import List, AsyncGenerator, Optional
+from typing import Dict, List, AsyncGenerator, Optional
+
+import boto3
+from botocore.exceptions import ClientError
+
 from snakemake_executor_plugin_aws_batch.batch_client import BatchClient
 from snakemake_executor_plugin_aws_batch.batch_job_builder import BatchJobBuilder
+from snakemake_executor_plugin_aws_batch.constant import FATAL_BATCH_STATUSES
 from snakemake_interface_executor_plugins.executors.base import SubmittedJobInfo
 from snakemake_interface_executor_plugins.executors.remote import RemoteExecutor
 from snakemake_interface_executor_plugins.settings import (
@@ -162,6 +167,19 @@ class Executor(RemoteExecutor):
         except Exception as e:
             raise WorkflowError(f"Failed to initialize AWS Batch client: {e}") from e
 
+        # Per-queue health-check results, keyed by queue ARN, so each effective
+        # queue (the global one or a per-rule ``batch_queue`` override) is
+        # described at most once across the whole run. Populated lazily by
+        # _validate_queue at submission time.
+        self._queue_validation_cache: Dict[str, Optional[List[str]]] = {}
+
+        # Fail fast on a definitively misconfigured job role before submitting any
+        # jobs (degrades to a no-op if state is uncertain). Queue/compute-env
+        # health is validated per effective queue at submission time instead —
+        # see _validate_queue — so an unused (possibly unhealthy) global queue
+        # never blocks a workflow that only submits to healthy per-rule queues.
+        self._preflight_validate()
+
     def run_job(self, job: JobExecutorInterface):
         # Implement here how to run a job.
         # You can access the job's resources, etc.
@@ -189,6 +207,17 @@ class Executor(RemoteExecutor):
                 job_command=self.format_job_exec(job),
                 batch_client=self.batch_client,
             )
+            # Validate the queue this job actually targets — which may be a
+            # per-rule ``batch_queue`` override, not the global one — before
+            # submitting, so a definitively broken queue fails fast instead of
+            # leaving the job stuck RUNNABLE. Cached per queue (see
+            # _validate_queue), so this costs one describe per distinct queue.
+            # Skipped for pre-existing job definitions: those deliberately avoid
+            # Describe* calls for a smaller IAM surface (same reason the builder
+            # skips platform detection for them), so we must not reintroduce a
+            # batch:DescribeJobQueues requirement on that path.
+            if not job_definition.uses_preexisting_job_definition:
+                self._validate_queue(job_definition.job_queue)
             job_info = job_definition.submit()
             log_info = {
                 "job_name": job_info["jobName"],
@@ -196,6 +225,11 @@ class Executor(RemoteExecutor):
                 "job_queue": job_definition.job_queue,
             }
             self.logger.debug(f"AWS Batch job submitted: {log_info}")
+        except WorkflowError:
+            # A queue-validation failure is already a clear, actionable message —
+            # let it surface as-is rather than re-wrapping it as a submit failure
+            # (the job was never submitted).
+            raise
         except Exception as e:
             raise WorkflowError(f"Failed to submit AWS Batch job: {e}") from e
 
@@ -333,3 +367,192 @@ class Executor(RemoteExecutor):
         # cleanup jobs
         for j in active_jobs:
             self.cleanup_job_resources(j)
+
+    def _preflight_validate(self) -> None:
+        """Fail fast on a definitively misconfigured job role before submitting.
+
+        Best-effort about *uncertainty*: a transient API error or a missing
+        iam permission degrades to a warning and the workflow proceeds. Only a
+        confirmed-missing job role raises here.
+
+        Job-queue and compute-environment health is intentionally *not* checked
+        here: which queue a job runs on can depend on a per-rule ``batch_queue``
+        resource that is not known until each job is built, and validating the
+        global queue at startup would wrongly reject a workflow that never
+        submits to it. That check happens per effective queue in
+        :meth:`_validate_queue` at submission time instead.
+        """
+        self._validate_job_role()
+
+    def _validate_queue(self, queue_arn: Optional[str]) -> None:
+        """Fail fast on a definitively misconfigured *effective* job queue.
+
+        Called at submission time with the queue a job actually targets (the
+        global queue or a per-rule ``batch_queue`` override). Each distinct queue
+        is described at most once — the result is cached on
+        ``self._queue_validation_cache`` — so a workflow that fans jobs across
+        several queues validates every queue it uses without re-describing any of
+        them, and never touches a queue it does not use.
+
+        Raises :class:`WorkflowError` only for a confirmed-bad queue (disabled or
+        invalid queue, no usable compute environment, ``maxvCpus=0``). Uncertainty
+        (a transient API error or a missing describe permission) degrades to a
+        no-op, exactly like :meth:`_queue_problems`.
+        """
+        if not queue_arn:
+            return
+        # Cache every outcome, including an uncertain ``None``: a describe that
+        # fails once is overwhelmingly a missing batch:DescribeJobQueues
+        # permission (persistent), so re-describing on every subsequent job would
+        # only spam warnings without ever succeeding. Accepting that a rare
+        # transient blip disables the check for this queue is the cheaper trade.
+        if queue_arn not in self._queue_validation_cache:
+            self._queue_validation_cache[queue_arn] = self._queue_problems(queue_arn)
+        problems = self._queue_validation_cache[queue_arn]
+        if problems:
+            raise WorkflowError(
+                "AWS Batch job queue validation failed — jobs would never start "
+                f"on queue {queue_arn}: "
+                + "; ".join(problems)
+                + ". Check the queue and its compute environment(s)."
+            )
+
+    def _queue_problems(self, queue_arn: Optional[str] = None) -> Optional[List[str]]:
+        """Return definitive job-queue / compute-environment misconfigurations.
+
+        Returns an empty list when everything looks healthy, a non-empty list of
+        problem descriptions when the queue or a compute environment is in a
+        state that would prevent jobs from ever starting (disabled/invalid,
+        ``maxvCpus=0``), or None when the state can't be determined (no queue
+        configured, or the queue describe itself failed — never block the
+        workflow on a transient failure or a missing describe permission).
+
+        The queue and compute-environment lookups fail independently: a failure
+        describing the compute environment(s) (e.g. a missing
+        ``batch:DescribeComputeEnvironments`` permission) still returns any
+        confirmed queue-level problems collected so far rather than discarding
+        them, so a definitively disabled/invalid queue is never masked by an
+        unrelated failure downstream.
+
+        Compute environments are judged collectively: AWS Batch falls back
+        across a queue's ``computeEnvironmentOrder``, so a compute-environment
+        problem is reported only when *every* attached environment is unusable —
+        one healthy environment is enough for jobs to run.
+
+        ``queue_arn`` names the queue to check; it defaults to the configured
+        global ``--aws-batch-job-queue`` but callers pass a per-rule
+        ``batch_queue`` override to validate the queue a job actually targets.
+        """
+        if queue_arn is None:
+            queue_arn = getattr(self.settings, "job_queue", None)
+        if not queue_arn:
+            return None
+        # If we can't even describe the queue, the state is unknown — degrade to
+        # a no-op rather than blocking the workflow on a transient failure or a
+        # missing batch:DescribeJobQueues permission.
+        try:
+            queues = self.batch_client.describe_job_queues(jobQueues=[queue_arn]).get(
+                "jobQueues", []
+            )
+        except Exception as e:
+            self.logger.warning(
+                "skipping AWS Batch job queue validation (could not check job "
+                f"queue): {e}"
+            )
+            return None
+        if not queues:
+            return ["job queue not found"]
+        jq = queues[0]
+        problems: List[str] = []
+        if jq.get("state") != "ENABLED":
+            problems.append(f"job queue is {jq.get('state')} (not ENABLED)")
+        if jq.get("status") in FATAL_BATCH_STATUSES:
+            problems.append(f"job queue status is {jq.get('status')}")
+        ce_arns = [
+            o.get("computeEnvironment") for o in jq.get("computeEnvironmentOrder", [])
+        ]
+        ce_arns = [c for c in ce_arns if c]
+        if ce_arns:
+            # A failure here must NOT discard the confirmed queue-level problems
+            # already collected above — return them instead of None.
+            try:
+                ces = self.batch_client.describe_compute_environments(
+                    computeEnvironments=ce_arns
+                ).get("computeEnvironments", [])
+            except Exception as e:
+                self.logger.warning(
+                    "could not check compute environment(s) during AWS Batch "
+                    f"job queue validation: {e}"
+                )
+                return problems
+            # AWS Batch tries a queue's compute environments in order and falls
+            # back to the next, so jobs are only definitively blocked when EVERY
+            # attached compute environment is unusable. Collect per-CE reasons
+            # but surface them only when none is usable — one healthy compute
+            # environment is enough for jobs to run.
+            ce_reasons: List[str] = []
+            any_usable = False
+            for ce in ces:
+                name = ce.get("computeEnvironmentName", "?")
+                reasons: List[str] = []
+                if ce.get("state") != "ENABLED":
+                    reasons.append(f"compute environment {name} is {ce.get('state')}")
+                if ce.get("status") in FATAL_BATCH_STATUSES:
+                    reasons.append(
+                        f"compute environment {name} status is {ce.get('status')}"
+                    )
+                if (ce.get("computeResources") or {}).get("maxvCpus") == 0:
+                    reasons.append(f"compute environment {name} has maxvCpus=0")
+                if reasons:
+                    ce_reasons.extend(reasons)
+                else:
+                    any_usable = True
+            if not any_usable:
+                # An empty ``ces`` here means the queue references compute
+                # environment(s) that a *successful* describe did not return —
+                # they no longer exist, so no job can start. Report the per-CE
+                # reasons when we have them, otherwise name the missing ARNs.
+                detail = (
+                    "; ".join(ce_reasons)
+                    if ce_reasons
+                    else "referenced compute environment(s) not found: "
+                    + ", ".join(ce_arns)
+                )
+                problems.append(
+                    "no usable compute environment on the job queue: " + detail
+                )
+        else:
+            # A queue whose ``computeEnvironmentOrder`` is empty is not attached
+            # to any compute environment, so AWS Batch has nowhere to place a job
+            # and it would sit RUNNABLE forever — a definitive misconfiguration.
+            problems.append("job queue has no compute environment attached")
+        return problems
+
+    def _validate_job_role(self) -> None:
+        """Verify the configured job role exists (best-effort; needs iam:GetRole).
+
+        A confirmed-missing role (``NoSuchEntity``) fails fast; anything else
+        (most importantly a missing ``iam:GetRole`` permission) degrades silently
+        so the check never blocks a workflow on uncertainty.
+        """
+        role_arn = getattr(self.settings, "job_role", None)
+        if not role_arn or "/" not in role_arn:
+            return
+        # GetRole takes the bare role name, not the IAM path: for
+        # arn:aws:iam::<acct>:role/<path>/<name> the name is the final segment.
+        role_name = role_arn.rsplit("/", 1)[-1]
+        try:
+            boto3.client("iam", region_name=self.settings.region).get_role(
+                RoleName=role_name
+            )
+        except ClientError as e:
+            if e.response.get("Error", {}).get("Code") == "NoSuchEntity":
+                raise WorkflowError(
+                    f"Configured AWS Batch job role does not exist: {role_arn}"
+                ) from e
+            self.logger.warning(
+                "skipping AWS Batch job-role preflight check "
+                f"(likely missing iam:GetRole): {e}"
+            )
+        except Exception as e:
+            self.logger.warning(f"skipping AWS Batch job-role preflight check: {e}")
