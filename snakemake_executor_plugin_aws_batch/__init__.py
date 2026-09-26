@@ -52,9 +52,18 @@ class ExecutorSettings(ExecutorSettingsBase):
     job_role: Optional[str] = field(
         default=None,
         metadata={
-            "help": "The AWS job role ARN that is used for running the tasks",
+            "help": (
+                "The AWS job role ARN that is used for running the tasks. Required "
+                "on the default (dynamic) path, where it is passed into the job "
+                "definition the plugin registers. Must be omitted when a "
+                "pre-existing job definition (--aws-batch-job-definition) is used, "
+                "since the role is baked into that definition externally."
+            ),
             "env_var": True,
-            "required": True,
+            # Conditionally required: enforced by validate_job_role_setting() rather
+            # than unconditionally here, so the pre-existing-definition path (which
+            # rejects job_role) remains reachable from the CLI.
+            "required": False,
         },
     )
     tags: Optional[dict] = field(
@@ -117,6 +126,34 @@ class ExecutorSettings(ExecutorSettingsBase):
     )
 
 
+def validate_job_role_setting(
+    job_definition: Optional[str], job_role: Optional[str]
+) -> None:
+    """Enforce that ``job_role`` is present unless a pre-existing definition is used.
+
+    ``job_role`` is only consumed on the default (dynamic) path, where the plugin
+    registers a job definition per job and passes the role into it (the point at
+    which AWS enforces ``iam:PassRole``). With a pre-existing definition
+    (``--aws-batch-job-definition``) the role is baked into the definition
+    externally and supplying ``--aws-batch-job-role`` is rejected outright by
+    ``BatchJobBuilder``. Marking the field unconditionally ``required`` would
+    therefore make the pre-existing-definition path impossible to configure — a
+    run without ``job_role`` fails settings validation, and a run with it is
+    rejected — so the requirement is enforced here, only when no pre-existing
+    definition is configured.
+
+    Raises:
+        WorkflowError: if no pre-existing job definition is set and ``job_role`` is
+            missing.
+    """
+    if job_definition is None and job_role is None:
+        raise WorkflowError(
+            "aws-batch-job-role (--aws-batch-job-role or the "
+            "SNAKEMAKE_AWS_BATCH_JOB_ROLE environment variable) is required unless "
+            "a pre-existing job definition (--aws-batch-job-definition) is used."
+        )
+
+
 # Required:
 # Specify common settings shared by various executors.
 common_settings = CommonSettings(
@@ -161,6 +198,8 @@ class Executor(RemoteExecutor):
 
         self.settings = self.workflow.executor_settings
         self.logger.debug(f"ExecutorSettings: {pformat(self.settings, indent=2)}")
+
+        validate_job_role_setting(self.settings.job_definition, self.settings.job_role)
 
         try:
             self.batch_client = BatchClient(region_name=self.settings.region)
