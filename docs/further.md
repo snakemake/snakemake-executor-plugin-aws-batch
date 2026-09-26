@@ -199,15 +199,17 @@ snakemake --jobs 4 \
 
 # Container Image Requirements
 
-The plugin does **not** auto-deploy the default storage provider to workers
-(`auto_deploy_default_storage_provider=False`): workers no longer run
-`pip install snakemake-storage-plugin-s3` at startup, because that pulls an
-unpinned version whose newer releases require snakemake >= 9 and break
-workers running snakemake 8.x. The container image used for jobs must
-therefore pre-install a compatible version of the storage plugin (e.g.
-`snakemake-storage-plugin-s3`) alongside snakemake itself. Image maintainers
-are responsible for pinning a plugin version compatible with the snakemake
-version in the image.
+The plugin supports Snakemake 8 and 9 and does **not** auto-deploy the default
+storage provider to workers (`auto_deploy_default_storage_provider=False`):
+workers do not run `pip install snakemake-storage-plugin-s3` at startup, because
+an unpinned install can pull a storage-plugin version whose
+`snakemake-interface-storage-plugins` requirement does not match the Snakemake
+major baked into the image, breaking the worker (e.g. Snakemake 8 needs a plugin
+built against `snakemake-interface-storage-plugins` 3.x, while recent Snakemake 9
+releases need one built against 4.x). The exact interface major tracks the
+installed Snakemake release, so the container image used for jobs must pre-install
+a storage-plugin version compatible with its Snakemake version. Image maintainers
+are responsible for pinning a compatible pair.
 
 # Scheduling Priority (Fair-Share Queues)
 
