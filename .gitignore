@@ -163,3 +163,6 @@ poetry.lock
 
 .terraform*
 terraform.tfstate*
+*.tfvars
+*.tfvars.json
+tfplan
