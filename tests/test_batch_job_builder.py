@@ -11,12 +11,14 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 from botocore.exceptions import ClientError
+from snakemake.common.tbdstring import TBDString
 from snakemake_interface_common.exceptions import WorkflowError
 
 from snakemake_executor_plugin_aws_batch.batch_job_builder import (
     SNAKEMAKE_AWS_BATCH_JOB_TAGS_ENV_VAR,
     BatchJobBuilder,
 )
+from snakemake_interface_executor_plugins.jobs import GroupJobExecutorInterface
 from snakemake_executor_plugin_aws_batch.constant import (
     BATCH_JOB_PLATFORM_CAPABILITIES,
 )
@@ -1038,6 +1040,207 @@ class TestSubmitSchedulingPriority:
 
 
 # ---------------------------------------------------------------------------
+# Tests for spot attempts (retryStrategy)
+# ---------------------------------------------------------------------------
+
+
+def _expected_retry_strategy(attempts: int) -> dict:
+    return {
+        "attempts": attempts,
+        "evaluateOnExit": [
+            {"onStatusReason": "Host EC2*", "action": "RETRY"},
+            {"onReason": "*", "action": "EXIT"},
+        ],
+    }
+
+
+def _make_builder_with_spot_attempts(setting_attempts=None, resource_attempts=None):
+    """Return a BatchJobBuilder for spot-attempts tests (None = unset/absent)."""
+    builder = _make_builder_with_priority()
+    builder.settings.spot_attempts = setting_attempts
+    if resource_attempts is not None:
+        builder.job.resources["aws_batch_spot_attempts"] = resource_attempts
+    return builder
+
+
+class TestSubmitSpotAttempts:
+    def test_unset_omits_retry_strategy(self):
+        builder = _make_builder_with_spot_attempts()
+        call_args = _run_submit_priority(builder)
+        assert "retryStrategy" not in call_args.kwargs
+
+    def test_setting_retries_only_host_termination(self):
+        builder = _make_builder_with_spot_attempts(setting_attempts=3)
+        call_args = _run_submit_priority(builder)
+        assert call_args.kwargs["retryStrategy"] == _expected_retry_strategy(3)
+
+    def test_resource_overrides_setting(self):
+        builder = _make_builder_with_spot_attempts(
+            setting_attempts=3, resource_attempts=1
+        )
+        call_args = _run_submit_priority(builder)
+        assert call_args.kwargs["retryStrategy"] == _expected_retry_strategy(1)
+
+    def test_resource_alone_works(self):
+        builder = _make_builder_with_spot_attempts(resource_attempts="5")
+        call_args = _run_submit_priority(builder)
+        assert call_args.kwargs["retryStrategy"] == _expected_retry_strategy(5)
+
+    @pytest.mark.parametrize("attempts", [1, 10])
+    def test_aws_limits_are_accepted(self, attempts):
+        builder = _make_builder_with_spot_attempts(setting_attempts=attempts)
+        call_args = _run_submit_priority(builder)
+        assert call_args.kwargs["retryStrategy"]["attempts"] == attempts
+
+    @pytest.mark.parametrize(
+        "setting, resource, match",
+        [
+            (0, None, r"--aws-batch-spot-attempts setting 0: must be in range"),
+            (11, None, r"--aws-batch-spot-attempts setting 11: must be in range"),
+            ("many", None, r"--aws-batch-spot-attempts setting 'many'"),
+            (3, 0, r"aws_batch_spot_attempts resource 0: must be in range"),
+            (None, "many", r"aws_batch_spot_attempts resource 'many'"),
+        ],
+    )
+    def test_invalid_values_raise_before_submit(self, setting, resource, match):
+        builder = _make_builder_with_spot_attempts(
+            setting_attempts=setting, resource_attempts=resource
+        )
+        with patch.object(
+            builder,
+            "build_job_definition",
+            return_value=(_fake_job_def(), "snakejob-test"),
+        ):
+            with pytest.raises(WorkflowError, match=match):
+                builder.submit()
+        builder.batch_client.submit_job.assert_not_called()
+
+    def test_invalid_resource_raises_before_registering_a_definition(self):
+        """An invalid resource must not leave a registered job definition behind."""
+        builder = _make_builder(tags=None)
+        builder.job.resources = dict(builder.job.resources, aws_batch_spot_attempts=11)
+        with pytest.raises(WorkflowError, match="aws_batch_spot_attempts resource"):
+            builder.submit()
+        builder.batch_client.register_job_definition.assert_not_called()
+        builder.batch_client.submit_job.assert_not_called()
+
+    def test_not_set_on_the_registered_job_definition(self):
+        """SubmitJob carries the strategy; the registered definition does not."""
+        builder = _make_builder(tags=None)
+        builder.settings.spot_attempts = 3
+        builder.batch_client.register_job_definition.return_value = _fake_job_def()
+        builder.batch_client.submit_job.return_value = {
+            "jobName": "snakejob-test",
+            "jobId": "abc-123",
+        }
+        builder.submit()
+        register_kwargs = builder.batch_client.register_job_definition.call_args
+        assert "retryStrategy" not in register_kwargs.kwargs
+        submit_kwargs = builder.batch_client.submit_job.call_args.kwargs
+        assert submit_kwargs["retryStrategy"] == _expected_retry_strategy(3)
+
+
+def _group_of(*member_resources: dict) -> MagicMock:
+    """A group job whose members have the given resources. The group's own
+    resources are what Snakemake would give it: parallel members' ints summed."""
+    group = MagicMock(spec=GroupJobExecutorInterface)
+    group.name = "test_group"
+    group.threads = 1
+    group.jobs = [MagicMock(resources=dict(r)) for r in member_resources]
+    group.resources = {
+        "_cores": 1,
+        "mem_mb": 1024,
+        "aws_batch_spot_attempts": sum(
+            r.get("aws_batch_spot_attempts", 0)
+            for r in member_resources
+            if not isinstance(r.get("aws_batch_spot_attempts"), str)
+        ),
+    }
+    return group
+
+
+class TestGroupSpotAttempts:
+    """A group job gets the smallest of its members' spot attempts."""
+
+    @pytest.mark.parametrize(
+        "setting, members, expected",
+        [
+            # Summed, the group's own resources would give 2 (a Batch retry).
+            (None, [{"aws_batch_spot_attempts": 1}] * 2, 1),
+            # Summed, 12 would be out of range and stop the workflow.
+            (None, [{"aws_batch_spot_attempts": 3}] * 4, 3),
+            # A member that opts out opts the group out.
+            (3, [{"aws_batch_spot_attempts": 1}, {}], 1),
+            # Members without the resource fall back to the setting.
+            (4, [{}, {}], 4),
+            (4, [{"aws_batch_spot_attempts": 6}, {}], 4),
+        ],
+    )
+    def test_smallest_member_value(self, setting, members, expected):
+        builder = _make_builder_with_spot_attempts(setting_attempts=setting)
+        builder.job = _group_of(*members)
+        call_args = _run_submit_priority(builder)
+        assert call_args.kwargs["retryStrategy"] == _expected_retry_strategy(expected)
+
+    @pytest.mark.parametrize(
+        "setting, expected",
+        [
+            # A member Snakemake cannot evaluate yet falls back to the setting.
+            (2, _expected_retry_strategy(2)),
+            # With no setting, only the other member's value counts.
+            (None, _expected_retry_strategy(5)),
+        ],
+    )
+    def test_member_not_yet_evaluated_is_unset(self, setting, expected):
+        builder = _make_builder_with_spot_attempts(setting_attempts=setting)
+        builder.job = _group_of(
+            {"aws_batch_spot_attempts": 5}, {"aws_batch_spot_attempts": TBDString()}
+        )
+        call_args = _run_submit_priority(builder)
+        assert call_args.kwargs["retryStrategy"] == expected
+
+    def test_unset_everywhere_omits_retry_strategy(self):
+        builder = _make_builder_with_spot_attempts()
+        builder.job = _group_of({}, {})
+        call_args = _run_submit_priority(builder)
+        assert "retryStrategy" not in call_args.kwargs
+
+    def test_invalid_member_value_raises(self):
+        builder = _make_builder_with_spot_attempts()
+        builder.job = _group_of({"aws_batch_spot_attempts": 0}, {})
+        with pytest.raises(WorkflowError, match="aws_batch_spot_attempts resource 0"):
+            _run_submit_priority(builder)
+
+
+class TestSpotAttemptsSetting:
+    """--aws-batch-spot-attempts is validated when the settings are built."""
+
+    def test_unset_is_none(self):
+        from snakemake_executor_plugin_aws_batch import ExecutorSettings
+
+        assert ExecutorSettings().spot_attempts is None
+
+    def test_valid_value_is_normalized_to_int(self):
+        from snakemake_executor_plugin_aws_batch import ExecutorSettings
+
+        assert ExecutorSettings(spot_attempts="3").spot_attempts == 3
+
+    @pytest.mark.parametrize(
+        "attempts, match",
+        [
+            (0, r"setting 0: must be in range \[1, 10\]"),
+            (11, r"setting 11: must be in range \[1, 10\]"),
+            ("many", r"setting 'many': must be an integer"),
+        ],
+    )
+    def test_invalid_value_raises_at_startup(self, attempts, match):
+        from snakemake_executor_plugin_aws_batch import ExecutorSettings
+
+        with pytest.raises(WorkflowError, match=match):
+            ExecutorSettings(spot_attempts=attempts)
+
+
+# ---------------------------------------------------------------------------
 # Tests for the per-rule aws_batch_container_image resource (Executor.run_job)
 # ---------------------------------------------------------------------------
 
@@ -1425,6 +1628,43 @@ class TestPreExistingJobDefinition:
         builder.submit()
         call_kwargs = builder.batch_client.submit_job.call_args.kwargs
         assert "schedulingPriorityOverride" not in call_kwargs
+
+    # --- spot attempts are mirrored into the pre-existing path ---
+
+    def test_spot_attempts_forwarded_in_preexisting_mode(self):
+        """retryStrategy must be mirrored from the dynamic path."""
+        builder = _make_builder_with_preexisting(job_definition="my-job-def")
+        builder.settings.spot_attempts = 4
+        builder.batch_client.submit_job.return_value = {
+            "jobName": "snakejob-test",
+            "jobId": "abc-123",
+        }
+        builder.submit()
+        call_kwargs = builder.batch_client.submit_job.call_args.kwargs
+        assert call_kwargs["retryStrategy"] == _expected_retry_strategy(4)
+
+    def test_spot_attempts_resource_forwarded_in_preexisting_mode(self):
+        builder = _make_builder_with_preexisting(
+            job_definition="my-job-def",
+            resources={"_cores": 2, "mem_mb": 2048, "aws_batch_spot_attempts": 2},
+        )
+        builder.batch_client.submit_job.return_value = {
+            "jobName": "snakejob-test",
+            "jobId": "abc-123",
+        }
+        builder.submit()
+        call_kwargs = builder.batch_client.submit_job.call_args.kwargs
+        assert call_kwargs["retryStrategy"] == _expected_retry_strategy(2)
+
+    def test_spot_attempts_omitted_when_unset_in_preexisting_mode(self):
+        builder = _make_builder_with_preexisting(job_definition="my-job-def")
+        builder.batch_client.submit_job.return_value = {
+            "jobName": "snakejob-test",
+            "jobId": "abc-123",
+        }
+        builder.submit()
+        call_kwargs = builder.batch_client.submit_job.call_args.kwargs
+        assert "retryStrategy" not in call_kwargs
 
     # --- default path unchanged when no pre-existing definition configured ---
 

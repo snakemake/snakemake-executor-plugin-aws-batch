@@ -273,7 +273,63 @@ rule align:
 
 The per-rule resource takes precedence over `--aws-batch-task-timeout`. When
 neither is set, AWS Batch imposes no timeout. When set, the value must be at
-least 60 seconds (the AWS minimum).
+least 60 seconds (the AWS minimum). See
+[Spot Reclaim Retries](#spot-reclaim-retries) for how it applies to a job that
+AWS Batch retries in place.
+
+# Spot Reclaim Retries
+
+When AWS reclaims an EC2 Spot instance, AWS Batch fails the jobs running on it
+(their `statusReason` starts with `Host EC2`). By default the plugin treats that like
+any other failure, so it spends one of the rule's `--retries` on a new Batch job.
+Set `--aws-batch-spot-attempts` (1-10) to have AWS Batch retry a host
+termination itself instead, inside the same Batch job:
+
+```sh
+snakemake --executor aws-batch --aws-batch-spot-attempts 3 ...
+```
+
+Every submitted job then carries a `retryStrategy` with that many attempts that
+retries only a host termination and exits on anything else, so a real failure
+(bad input, out of memory, a bug) still reaches Snakemake and `--retries` as
+before. This keeps the two apart: reclaims no longer use up `--retries`, and
+`--retries` need not be raised to absorb them, which would re-run every real
+failure that many more times. When the attempts run out, the job fails as it
+does today and `--retries` takes over.
+
+A rule can override the setting with the `aws_batch_spot_attempts` resource. For
+example, `aws_batch_spot_attempts=1` sends a reclaim straight to Snakemake, so a
+rule whose queue depends on the attempt can move to an on-demand queue after one
+reclaim:
+
+```python
+rule align:
+    resources:
+        aws_batch_spot_attempts=1,
+        batch_queue=lambda wildcards, attempt: (
+            SPOT_QUEUE if attempt == 1 else ON_DEMAND_QUEUE
+        ),
+    ...
+```
+
+The per-rule resource takes precedence over `--aws-batch-spot-attempts`. When
+neither is set, the plugin sends no `retryStrategy`, so a pre-existing job
+definition's own, if any, applies. The strategy is set on `SubmitJob`, so it
+also applies to (and overrides the `retryStrategy` of) a pre-existing job
+definition. A group job runs as one Batch job and gets the smallest of its
+members' values, so a member with `aws_batch_spot_attempts=1` opts the group
+out. A member whose resource is a function of inputs that do not exist yet when
+the group is submitted counts as not setting it (it uses the setting). An invalid `--aws-batch-spot-attempts` fails at startup. An invalid
+resource stops the workflow, cancelling its running jobs, when a job of that
+rule is submitted (like an invalid `aws_batch_task_timeout`), so a value
+computed from `attempt` must stay within 1-10 on every attempt.
+
+Only an EC2 host termination is retried. A Fargate Spot interruption (possible
+with a pre-existing job definition on a Fargate Spot queue) is reported
+differently, so it is not retried in the job and reaches `--retries` as before.
+A task timeout (`--aws-batch-task-timeout` / `aws_batch_task_timeout`) applies
+to each attempt, so a job that is reclaimed and retried can run for up to
+`attempts` times the timeout in all.
 
 # Shared Memory (`/dev/shm`)
 
@@ -363,12 +419,14 @@ The `--aws-batch-container-image` (`container_image`) setting and the per-rule
 `aws_batch_container_image` resource are both silently ignored in this mode — the
 container image is taken from the pre-existing definition.
 
-Task timeout and scheduling priority **are** still honored: `--aws-batch-task-timeout`
-(and the per-rule `aws_batch_task_timeout` resource) and the scheduling priority
-(`--aws-batch-scheduling-priority` / the per-rule `aws_batch_scheduling_priority`
-resource) travel as `SubmitJob`'s top-level `timeout` and `schedulingPriorityOverride`
-fields, so they apply to pre-existing definitions just as they do to dynamically
-registered ones.
+Task timeout, scheduling priority and spot attempts **are** still honored:
+`--aws-batch-task-timeout` (and the per-rule `aws_batch_task_timeout` resource),
+the scheduling priority (`--aws-batch-scheduling-priority` / the per-rule
+`aws_batch_scheduling_priority` resource) and the spot attempts
+(`--aws-batch-spot-attempts` / the per-rule `aws_batch_spot_attempts` resource)
+travel as `SubmitJob`'s top-level `timeout`, `schedulingPriorityOverride` and
+`retryStrategy` fields, so they apply to pre-existing definitions just as they
+do to dynamically registered ones.
 
 # Preflight Validation
 
