@@ -636,6 +636,43 @@ class TestSharedMemorySize:
 
 
 # ---------------------------------------------------------------------------
+# Tests for build_job_definition — log_group
+# ---------------------------------------------------------------------------
+
+
+class TestLogGroup:
+    def _build(self, **settings):
+        builder = _make_builder(tags=None)
+        for key, value in settings.items():
+            setattr(builder.settings, key, value)
+        builder.batch_client.register_job_definition.return_value = _fake_job_def()
+        builder.build_job_definition()
+        return builder.batch_client.register_job_definition.call_args.kwargs[
+            "containerProperties"
+        ]
+
+    def test_log_group_sets_awslogs_configuration(self):
+        props = self._build(log_group="/snakemake/my-project", region="us-east-1")
+        assert props["logConfiguration"] == {
+            "logDriver": "awslogs",
+            "options": {
+                "awslogs-group": "/snakemake/my-project",
+                "awslogs-region": "us-east-1",
+            },
+        }
+
+    def test_log_group_without_region_omits_awslogs_region(self):
+        props = self._build(log_group="/snakemake/my-project")
+        assert props["logConfiguration"]["options"] == {
+            "awslogs-group": "/snakemake/my-project"
+        }
+
+    def test_unset_log_group_omits_log_configuration(self):
+        props = self._build(log_group=None, region="us-east-1")
+        assert "logConfiguration" not in props
+
+
+# ---------------------------------------------------------------------------
 # Tests for build_job_definition — Fargate rejection
 # ---------------------------------------------------------------------------
 
@@ -1510,6 +1547,31 @@ class TestPreExistingJobDefinition:
             job_role="arn:aws:iam::123456789:role/my-role",
         )
         with pytest.raises(WorkflowError, match="job_role"):
+            builder.submit()
+        builder.batch_client.register_job_definition.assert_not_called()
+        builder.batch_client.submit_job.assert_not_called()
+
+    def test_log_group_plus_job_definition_raises(self):
+        """log_group + job_definition must raise WorkflowError."""
+        builder = _make_builder_with_preexisting(job_definition="my-job-def")
+        builder.settings.log_group = "/snakemake/my-project"
+        with pytest.raises(WorkflowError, match="log_group"):
+            builder.submit()
+        builder.batch_client.register_job_definition.assert_not_called()
+        builder.batch_client.submit_job.assert_not_called()
+
+    def test_log_group_plus_per_rule_job_definition_raises(self):
+        """log_group + a per-rule aws_batch_job_definition must raise too."""
+        builder = _make_builder_with_preexisting(
+            job_definition=None,
+            resources={
+                "_cores": 2,
+                "mem_mb": 2048,
+                "aws_batch_job_definition": "per-rule-def",
+            },
+        )
+        builder.settings.log_group = "/snakemake/my-project"
+        with pytest.raises(WorkflowError, match="aws_batch_job_definition"):
             builder.submit()
         builder.batch_client.register_job_definition.assert_not_called()
         builder.batch_client.submit_job.assert_not_called()

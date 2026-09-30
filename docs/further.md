@@ -348,6 +348,30 @@ This sets `linuxParameters.sharedMemorySize` on the job definition. It only
 applies on EC2 queues — Fargate does not honor
 `linuxParameters.sharedMemorySize`, so the resource is ignored there.
 
+# Task Logs
+
+Unless told otherwise, AWS Batch sends every job's output to the CloudWatch
+Logs group `/aws/batch/job`, which all Batch jobs in the account and region
+share. Because CloudWatch Logs grants read access per log group, anyone who may
+read one workflow's job logs there may read every workflow's. Retention and KMS
+encryption are also set per group. To send a workflow's jobs to their own group,
+set `--aws-batch-log-group`:
+
+```bash
+snakemake --executor aws-batch \
+    --aws-batch-log-group /snakemake/my-project \
+    ...
+```
+
+This sets the `awslogs` log driver on each job definition the plugin registers,
+with `awslogs-group` set to the given group and `awslogs-region` to
+`--aws-batch-region`. It takes the group's name, not its ARN. The group must
+already exist (the plugin does not create it), and the compute environment's ECS
+instance role needs `logs:CreateLogStream` and `logs:PutLogEvents` on it. The
+executor role needs no additional permissions; with `logs:DescribeLogGroups` it
+also checks at startup that the group exists (see [Preflight
+Validation](#preflight-validation)).
+
 # Job Tags
 
 Tags from `--aws-batch-tags` are applied to every job definition and job
@@ -421,6 +445,8 @@ definition:
   `aws_batch_job_definition` resource it is rejected when that job is submitted.
 - The per-rule `shared_memory_size_mb` resource: `linuxParameters.sharedMemorySize`
   is a definition-level field (rejected at job submission).
+- `--aws-batch-log-group` (`log_group`): the log configuration is a
+  definition-level field (rejected at job submission).
 
 The `--aws-batch-container-image` (`container_image`) setting and the per-rule
 `aws_batch_container_image` resource are both silently ignored in this mode — the
@@ -445,18 +471,21 @@ environments is usable (`ENABLED`, not in a failed/deleting state, and
 `maxvCpus > 0` — AWS Batch falls back across the queue's
 `computeEnvironmentOrder`, so one healthy environment is enough), and — when
 `--aws-batch-job-role` is set and `iam:GetRole` is available — that the job role
-exists. A confirmed misconfiguration (a disabled/failed queue, a queue with no
-usable compute environment, or a non-existent job role) fails fast with a clear
-error.
+exists, and — when `--aws-batch-log-group` is set and `logs:DescribeLogGroups`
+is available — that the log group exists. A confirmed misconfiguration (a
+disabled/failed queue, a queue with no usable compute environment, a
+non-existent job role, or a malformed or non-existent log group) fails fast with
+a clear error.
 
 The check is deliberately conservative about *uncertainty*: a transient API
 error, a queue mid-update (`status` `CREATING`/`UPDATING`), or a missing
-`iam:GetRole` permission is logged as a warning and the check is skipped rather
-than failing the workflow. It reuses the `batch:DescribeJobQueues` /
-`batch:DescribeComputeEnvironments` permissions the executor already needs for
-platform detection (so a run missing those is not blocked by preflight, but will
-still fail later when the job definition is built), plus the optional
-`iam:GetRole` for the job-role check.
+`iam:GetRole` or `logs:DescribeLogGroups` permission is logged as a warning and
+the check is skipped rather than failing the workflow. It reuses the
+`batch:DescribeJobQueues` / `batch:DescribeComputeEnvironments` permissions the
+executor already needs for platform detection (so a run missing those is not
+blocked by preflight, but will still fail later when the job definition is
+built), plus the optional `iam:GetRole` for the job-role check and
+`logs:DescribeLogGroups` for the log-group check.
 
 When tags are configured (via `--aws-batch-tags` or the
 `SNAKEMAKE_AWS_BATCH_JOB_TAGS` environment variable), the executor additionally

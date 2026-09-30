@@ -460,6 +460,20 @@ class BatchJobBuilder:
                 "sharedMemorySize": shm_size,
             }
 
+        # Optional log group. Without a logConfiguration, AWS Batch sends every
+        # job's output to /aws/batch/job, shared by all Batch jobs in the account
+        # and region.
+        log_group = getattr(self.settings, "log_group", None)
+        if log_group:
+            log_options = {"awslogs-group": log_group}
+            region = getattr(self.settings, "region", None)
+            if region:
+                log_options["awslogs-region"] = region
+            container_properties["logConfiguration"] = {
+                "logDriver": "awslogs",
+                "options": log_options,
+            }
+
         # Only include `timeout` when a timeout is explicitly set — omitting the
         # key means AWS Batch applies no timeout, which is the correct default for
         # long-running bioinformatics workloads.
@@ -635,8 +649,9 @@ class BatchJobBuilder:
         ``job_role`` is baked into the job definition at registration time and
         cannot be overridden via ``containerOverrides``.  ``shared_memory_size_mb``
         maps to ``linuxParameters.sharedMemorySize`` on the definition, not a
-        container override.  Both are silently useless in pre-existing mode, so we
-        raise early rather than silently ignore.
+        container override, and ``log_group`` to its ``logConfiguration``.  All are
+        silently useless in pre-existing mode, so we raise early rather than
+        silently ignore.
 
         ``container_image`` cannot be distinguished from its default value so we
         document in the setting help text that it is ignored and do not raise here.
@@ -654,6 +669,14 @@ class BatchJobBuilder:
                 "--aws-batch-job-definition: shared memory sizing is managed "
                 "externally when using a pre-existing job definition.  Remove the "
                 "shared_memory_size_mb resource or omit --aws-batch-job-definition."
+            )
+        if getattr(self.settings, "log_group", None):
+            raise WorkflowError(
+                "Cannot combine log_group (--aws-batch-log-group) with a pre-existing "
+                "job definition (--aws-batch-job-definition or the per-rule "
+                "aws_batch_job_definition resource): the log configuration is "
+                "managed externally when using a pre-existing job definition.  "
+                "Remove --aws-batch-log-group or the pre-existing job definition."
             )
 
     def _submit_with_preexisting_definition(self, job_definition: str) -> dict:
