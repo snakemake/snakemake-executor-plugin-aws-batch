@@ -241,6 +241,16 @@ rule critical_path:
     ...
 ```
 
+The priority must be an integer in [0, 9999] (the AWS Batch range). An invalid
+`--aws-batch-scheduling-priority` fails at startup; an invalid resource fails
+when a job of that rule is submitted, before anything is registered with AWS
+Batch. A group job runs as one Batch job and gets the highest of its members'
+priorities (each member's resource, or else `--aws-batch-scheduling-priority`;
+members with neither are ignored), so it is scheduled no later than its most
+urgent member would be. A member whose resource is a function of inputs that do
+not exist yet when the group is submitted counts as not setting it (it uses the
+setting).
+
 # Per-Rule Job Queues
 
 By default all jobs are submitted to the queue given by
@@ -260,7 +270,7 @@ Platform detection and job submission both use the resolved per-rule queue.
 # Task Timeout
 
 By default jobs have no timeout. Set `--aws-batch-task-timeout` to impose a
-workflow-wide limit (in seconds; minimum 60). A rule can override this with the
+workflow-wide limit (in seconds; 60 to 2147483647). A rule can override this with the
 `aws_batch_task_timeout` resource, e.g. to give a long-running alignment step
 more time while keeping a tight limit on bookkeeping rules:
 
@@ -272,8 +282,24 @@ rule align:
 ```
 
 The per-rule resource takes precedence over `--aws-batch-task-timeout`. When
-neither is set, AWS Batch imposes no timeout. When set, the value must be at
-least 60 seconds (the AWS minimum). See
+neither is set, AWS Batch imposes no timeout. When set, the value must be a
+whole number of seconds in [60, 2147483647] (the AWS Batch limits). An invalid
+`--aws-batch-task-timeout`, including a fractional one, fails at startup; an
+invalid resource fails when a job of that rule is submitted, before anything is
+registered with AWS Batch. Snakemake rounds a fractional number given as a
+resource before the plugin sees it, so e.g. `aws_batch_task_timeout=3600.4`
+becomes 3600 rather than failing. The same holds for the scheduling priority
+and spot attempts.
+
+A group job runs as one Batch job, and its members may run one after another
+within it, so it gets the sum of its members' timeouts (each member's resource,
+or else `--aws-batch-task-timeout`). Only the group as a whole is limited, to
+that sum; a member is not held to its own timeout, so one member may use time
+another leaves unused. If any member has no timeout, neither does the group. A
+member whose resource is a function of inputs that do not exist yet when the
+group is submitted counts as not setting it, so it contributes
+`--aws-batch-task-timeout`, or leaves the group without a timeout if that is
+unset. A sum above 2147483647 seconds fails when the group is submitted. See
 [Spot Reclaim Retries](#spot-reclaim-retries) for how it applies to a job that
 AWS Batch retries in place.
 
@@ -319,7 +345,8 @@ also applies to (and overrides the `retryStrategy` of) a pre-existing job
 definition. A group job runs as one Batch job and gets the smallest of its
 members' values, so a member with `aws_batch_spot_attempts=1` opts the group
 out. A member whose resource is a function of inputs that do not exist yet when
-the group is submitted counts as not setting it (it uses the setting). An invalid `--aws-batch-spot-attempts` fails at startup. An invalid
+the group is submitted counts as not setting it (it uses the setting). An
+invalid `--aws-batch-spot-attempts` fails at startup. An invalid
 resource stops the workflow, cancelling its running jobs, when a job of that
 rule is submitted (like an invalid `aws_batch_task_timeout`), so a value
 computed from `attempt` must stay within 1-10 on every attempt.
@@ -329,7 +356,8 @@ with a pre-existing job definition on a Fargate Spot queue) is reported
 differently, so it is not retried in the job and reaches `--retries` as before.
 A task timeout (`--aws-batch-task-timeout` / `aws_batch_task_timeout`) applies
 to each attempt, so a job that is reclaimed and retried can run for up to
-`attempts` times the timeout in all.
+`attempts` times the timeout in all (for a group job, `attempts` times the sum
+of its members' timeouts).
 
 # Shared Memory (`/dev/shm`)
 
@@ -459,7 +487,8 @@ the scheduling priority (`--aws-batch-scheduling-priority` / the per-rule
 (`--aws-batch-spot-attempts` / the per-rule `aws_batch_spot_attempts` resource)
 travel as `SubmitJob`'s top-level `timeout`, `schedulingPriorityOverride` and
 `retryStrategy` fields, so they apply to pre-existing definitions just as they
-do to dynamically registered ones.
+do to dynamically registered ones, including a group job's summed timeout,
+highest priority and smallest spot attempts.
 
 # Preflight Validation
 

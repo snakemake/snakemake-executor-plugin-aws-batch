@@ -16,7 +16,9 @@ from snakemake_executor_plugin_aws_batch.batch_client import BatchClient
 from snakemake_executor_plugin_aws_batch.batch_job_builder import (
     BatchJobBuilder,
     build_job_tags,
+    validate_scheduling_priority,
     validate_spot_attempts,
+    validate_task_timeout,
 )
 from snakemake_executor_plugin_aws_batch.constant import FATAL_BATCH_STATUSES
 from snakemake_interface_executor_plugins.executors.base import SubmittedJobInfo
@@ -109,7 +111,10 @@ class ExecutorSettings(ExecutorSettingsBase):
             "help": (
                 "Task timeout in seconds: AWS Batch terminates a job that does not "
                 "finish within this limit. Jobs have no timeout unless this is set. "
-                "When set, the value must be at least 60 (the AWS minimum)."
+                "When set, the value must be in range [60, 2147483647] (the AWS "
+                "Batch limits). Per-rule overrides via the aws_batch_task_timeout "
+                "resource take precedence. A group job gets the sum of its members' "
+                "timeouts, and none if any member has none."
             ),
             "env_var": False,
             "required": False,
@@ -120,10 +125,11 @@ class ExecutorSettings(ExecutorSettingsBase):
         metadata={
             "help": (
                 "Default scheduling priority applied to every submitted job "
-                "(schedulingPriorityOverride). Only meaningful on fair-share job "
-                "queues, i.e. queues with a scheduling policy attached; ignored "
-                "otherwise. Per-rule overrides via the "
-                "aws_batch_scheduling_priority resource take precedence."
+                "(schedulingPriorityOverride, 0-9999). Only meaningful on "
+                "fair-share job queues, i.e. queues with a scheduling policy "
+                "attached; ignored otherwise. Per-rule overrides via the "
+                "aws_batch_scheduling_priority resource take precedence. A group "
+                "job gets the highest of its members' priorities."
             ),
             "env_var": False,
             "required": False,
@@ -140,7 +146,8 @@ class ExecutorSettings(ExecutorSettingsBase):
                 "before. Unset, the plugin sends no retryStrategy (a pre-existing job "
                 "definition's own, if any, applies) and a host termination fails the "
                 "job like any other failure. Per-rule overrides via the "
-                "aws_batch_spot_attempts resource take precedence."
+                "aws_batch_spot_attempts resource take precedence. A group job gets "
+                "the smallest of its members' values."
             ),
             "env_var": False,
             "required": False,
@@ -184,8 +191,16 @@ class ExecutorSettings(ExecutorSettingsBase):
     )
 
     def __post_init__(self):
-        # Fail at startup, not at the first submit, on an invalid value (a
-        # per-rule aws_batch_spot_attempts resource is checked at submit).
+        # Fail at startup, not at the first submit, on an invalid value (the
+        # per-rule aws_batch_* resources are checked at submit).
+        if self.task_timeout is not None:
+            self.task_timeout = validate_task_timeout(
+                self.task_timeout, "--aws-batch-task-timeout setting"
+            )
+        if self.scheduling_priority is not None:
+            self.scheduling_priority = validate_scheduling_priority(
+                self.scheduling_priority, "--aws-batch-scheduling-priority setting"
+            )
         if self.spot_attempts is not None:
             self.spot_attempts = validate_spot_attempts(
                 self.spot_attempts, "--aws-batch-spot-attempts setting"

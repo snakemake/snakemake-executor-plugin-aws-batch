@@ -1,7 +1,7 @@
 import os
 import re
 import uuid
-from typing import Any, List, Optional
+from typing import Any, Callable, List, Optional
 from botocore.exceptions import ClientError
 from snakemake_interface_common.exceptions import WorkflowError
 from snakemake_interface_executor_plugins.jobs import (
@@ -33,24 +33,75 @@ def _is_tbd(value: Any) -> bool:
     return isinstance(value, str) and value == TBD_RESOURCE_VALUE
 
 
-def validate_spot_attempts(attempts: Any, source: str) -> int:
-    """``attempts`` as an int in AWS Batch's retryStrategy range [1, 10].
+# AWS Batch's timeout (attemptDurationSeconds) is a 32-bit signed Integer.
+MAX_TASK_TIMEOUT = 2**31 - 1
 
-    ``source`` names where the value came from, for the error. Raises
-    ``WorkflowError`` for a non-integer or out-of-range value.
+
+def _as_integer(value: Any) -> int:
+    """``value`` as an int: an int as is, anything else through ``float`` (so
+    ``3600.0`` and ``"3600.0"`` pass). Every bound the plugin checks is well
+    below 2**53, where a float stops holding integers exactly. Raises
+    ``ValueError`` for a fractional or non-finite value.
     """
+    if isinstance(value, int):
+        return value
+    number = float(value)
+    if not number.is_integer():
+        raise ValueError(f"{value!r} is not a whole number")
+    return int(number)
+
+
+def _validate_int_range(
+    value: Any,
+    source: str,
+    minimum: int,
+    maximum: int,
+    unit: str = "",
+) -> int:
+    """``value`` as an int in ``[minimum, maximum]``.
+
+    Accepts an int, a whole-number float (``3600.0``) or a string of either, as a
+    Snakemake resource or command-line value may arrive. Rejects a bool (``True``
+    is an int to Python, but never a meaningful count) and a fractional value,
+    which ``int()`` would silently truncate (Snakemake rounds a float per-rule
+    resource before the plugin sees it, so that reaches here only as a setting
+    or a string). ``source`` names where the value came from (a setting or a
+    per-rule resource) and ``unit`` what it counts, for the error. Raises
+    ``WorkflowError`` for an invalid or out-of-range value.
+    """
+    what = f"an integer number of {unit}" if unit else "an integer"
+    # Checked first: float(True) is 1.0, an integral float, so the conversion
+    # below would accept it.
+    if isinstance(value, bool):
+        raise WorkflowError(f"Invalid {source} {value!r}: must be {what}.")
     try:
-        attempts_int = int(attempts)
-    except (TypeError, ValueError) as e:
+        integer = _as_integer(value)
+    except (TypeError, ValueError, OverflowError) as e:
+        raise WorkflowError(f"Invalid {source} {value!r}: must be {what}.") from e
+    if not minimum <= integer <= maximum:
+        unit_suffix = f" {unit}" if unit else ""
         raise WorkflowError(
-            f"Invalid {source} {attempts!r}: must be an integer."
-        ) from e
-    if not (1 <= attempts_int <= 10):
-        raise WorkflowError(
-            f"Invalid {source} {attempts_int}: "
-            "must be in range [1, 10] (the AWS Batch limit)."
+            f"Invalid {source} {integer}: must be in range [{minimum}, {maximum}]"
+            f"{unit_suffix} (the AWS Batch limit)."
         )
-    return attempts_int
+    return integer
+
+
+def validate_spot_attempts(attempts: Any, source: str) -> int:
+    """``attempts`` as an int in AWS Batch's retryStrategy range [1, 10]."""
+    return _validate_int_range(attempts, source, 1, 10)
+
+
+def validate_task_timeout(timeout: Any, source: str) -> int:
+    """``timeout`` as an int number of seconds in AWS Batch's range: at least 60,
+    and at most ``MAX_TASK_TIMEOUT``."""
+    return _validate_int_range(timeout, source, 60, MAX_TASK_TIMEOUT, "seconds")
+
+
+def validate_scheduling_priority(priority: Any, source: str) -> int:
+    """``priority`` as an int in AWS Batch's schedulingPriorityOverride range
+    [0, 9999]."""
+    return _validate_int_range(priority, source, 0, 9999)
 
 
 def build_job_tags(settings) -> dict:
@@ -502,38 +553,90 @@ class BatchJobBuilder:
         """Build the merged tags dict for this job (see :func:`build_job_tags`)."""
         return build_job_tags(self.settings)
 
+    def _member_jobs(self) -> List[JobExecutorInterface]:
+        """The jobs whose resources apply: a group job's members, else the job.
+
+        A group job runs as one Batch job, but its own ``resources`` do not hold
+        its members' per-rule settings: Snakemake sums integer resources across
+        members that run in parallel. The resolvers below read each member and
+        combine the values instead.
+        """
+        if isinstance(self.job, GroupJobExecutorInterface):
+            return list(self.job.jobs)
+        return [self.job]
+
+    def _job_int_setting(
+        self,
+        job: JobExecutorInterface,
+        resource: str,
+        setting: str,
+        validate: Callable[[Any, str], int],
+    ) -> Optional[int]:
+        """One (non-group) job's validated value, or ``None`` when unset.
+
+        The per-rule ``resource`` takes precedence over the workflow-level
+        ``setting`` (an ``ExecutorSettings`` attribute, whose flag is
+        ``--aws-batch-<setting>``). An invalid resource of a group member names
+        the member, as Snakemake reports the failure against the whole group.
+
+        A resource Snakemake could not evaluate yet counts as unset, so the
+        setting applies: a group job's member whose resource is a function of
+        inputs that do not exist when the group is submitted arrives as the
+        placeholder ``<TBD>``. Snakemake itself leaves such values out of a
+        group's resources.
+        """
+        value = job.resources.get(resource)
+        if value is not None and not _is_tbd(value):
+            source = f"{resource} resource"
+            if job is not self.job:
+                source += f" (group member {job.name})"
+            return validate(value, source)
+        value = getattr(self.settings, setting, None)
+        if value is not None:
+            flag = "--aws-batch-" + setting.replace("_", "-")
+            return validate(value, f"{flag} setting")
+        return None
+
+    def _member_values(
+        self, resource: str, setting: str, validate: Callable[[Any, str], int]
+    ) -> List[Optional[int]]:
+        """Each member job's validated value (``None`` when unset); see
+        ``_member_jobs`` and ``_job_int_setting``."""
+        return [
+            self._job_int_setting(job, resource, setting, validate)
+            for job in self._member_jobs()
+        ]
+
     def _resolve_task_timeout(self) -> Optional[int]:
         """Resolve the effective task timeout in seconds, or ``None``.
 
         The per-rule ``aws_batch_task_timeout`` resource takes precedence over
         the workflow-level ``task_timeout`` setting. Returns ``None`` when neither
         is set so the ``timeout`` field can be omitted entirely (AWS Batch then
-        applies no timeout). Enforces the AWS minimum of 60 s locally so the error
-        is clear rather than a Batch API rejection. Raises ``WorkflowError`` for
-        non-integer or sub-minimum values.
+        applies no timeout). Raises ``WorkflowError`` for a non-integer value or
+        one outside AWS Batch's range (60 s to ``MAX_TASK_TIMEOUT``).
+
+        A group job gets the sum of its members' timeouts, because its members
+        may run one after another inside the one Batch job: the largest member's
+        timeout alone would kill a group of dependent members that each finish
+        in time. Only the group as a whole is limited, to that sum; a member is
+        not held to its own timeout. A member without a timeout leaves the group
+        without one. Raises ``WorkflowError`` naming the group when the sum
+        exceeds ``MAX_TASK_TIMEOUT``.
         """
-        rule_timeout = self.job.resources.get("aws_batch_task_timeout")
-        if rule_timeout is not None:
-            task_timeout = rule_timeout
-            timeout_source = "aws_batch_task_timeout resource"
-        else:
-            task_timeout = getattr(self.settings, "task_timeout", None)
-            timeout_source = "--aws-batch-task-timeout"
-        if task_timeout is None:
+        timeouts = self._member_values(
+            "aws_batch_task_timeout", "task_timeout", validate_task_timeout
+        )
+        if not timeouts or any(timeout is None for timeout in timeouts):
             return None
-        try:
-            task_timeout = int(task_timeout)
-        except (TypeError, ValueError) as e:
+        total = sum(timeouts)
+        if total > MAX_TASK_TIMEOUT:
             raise WorkflowError(
-                f"Invalid {timeout_source} value {task_timeout!r}: "
-                "must be an integer number of seconds (minimum 60)."
-            ) from e
-        if task_timeout < 60:
-            raise WorkflowError(
-                f"{timeout_source} must be at least 60 seconds (AWS minimum), "
-                f"got {task_timeout}."
+                f"Invalid task timeout for group job {self.job.name}: the sum of "
+                f"its members' timeouts, {total} seconds, exceeds the AWS Batch "
+                f"maximum of {MAX_TASK_TIMEOUT} seconds."
             )
-        return task_timeout
+        return total
 
     def _resolve_scheduling_priority(self) -> Optional[int]:
         """Resolve the effective scheduling priority override, or ``None``.
@@ -544,29 +647,17 @@ class BatchJobBuilder:
         ``schedulingPriorityOverride`` kwarg can be omitted entirely — keeping
         submissions byte-identical on non-fair-share queues. Raises
         ``WorkflowError`` for non-integer or out-of-range values.
+
+        A group job gets the highest of its members' priorities, so it is
+        scheduled no later than its most urgent member would be on its own;
+        members without one are ignored.
         """
-        resource_priority = self.job.resources.get("aws_batch_scheduling_priority")
-        setting_priority = getattr(self.settings, "scheduling_priority", None)
-        if resource_priority is not None:
-            priority = resource_priority
-            priority_source = "aws_batch_scheduling_priority resource"
-        elif setting_priority is not None:
-            priority = setting_priority
-            priority_source = "--aws-batch-scheduling-priority setting"
-        else:
-            return None
-        try:
-            priority_int = int(priority)
-        except (TypeError, ValueError) as e:
-            raise WorkflowError(
-                f"Invalid {priority_source} {priority!r}: must be an integer."
-            ) from e
-        if not (0 <= priority_int <= 9999):
-            raise WorkflowError(
-                f"Invalid {priority_source} {priority_int}: "
-                "must be in range [0, 9999]."
-            )
-        return priority_int
+        priorities = self._member_values(
+            "aws_batch_scheduling_priority",
+            "scheduling_priority",
+            validate_scheduling_priority,
+        )
+        return max((p for p in priorities if p is not None), default=None)
 
     def _resolve_spot_attempts(self) -> Optional[int]:
         """Resolve the effective attempts for a host-terminated job, or ``None``.
@@ -576,38 +667,13 @@ class BatchJobBuilder:
         is set so the ``retryStrategy`` kwarg can be omitted entirely. Raises
         ``WorkflowError`` for non-integer values or values outside AWS's 1-10.
 
-        A group job runs as one Batch job, so it gets the smallest of its member
-        jobs' values: a member that opts out (1) opts the group out. Its own
-        ``resources`` would not do: Snakemake sums a group's integer resources
-        across members that run in parallel. A member whose resource Snakemake
-        cannot evaluate yet (``<TBD>``) counts as not setting it, so it falls
-        back to the setting.
+        A group job gets the smallest of its members' values: a member that opts
+        out (1) opts the group out.
         """
-        if isinstance(self.job, GroupJobExecutorInterface):
-            member_attempts = [
-                attempts
-                for attempts in map(self._job_spot_attempts, self.job.jobs)
-                if attempts is not None
-            ]
-            return min(member_attempts, default=None)
-        return self._job_spot_attempts(self.job)
-
-    def _job_spot_attempts(self, job: JobExecutorInterface) -> Optional[int]:
-        """One (non-group) job's spot attempts, or ``None``; see
-        ``_resolve_spot_attempts``."""
-        resource_attempts = job.resources.get("aws_batch_spot_attempts")
-        if _is_tbd(resource_attempts):
-            resource_attempts = None
-        setting_attempts = getattr(self.settings, "spot_attempts", None)
-        if resource_attempts is not None:
-            attempts = resource_attempts
-            attempts_source = "aws_batch_spot_attempts resource"
-        elif setting_attempts is not None:
-            attempts = setting_attempts
-            attempts_source = "--aws-batch-spot-attempts setting"
-        else:
-            return None
-        return validate_spot_attempts(attempts, attempts_source)
+        attempts = self._member_values(
+            "aws_batch_spot_attempts", "spot_attempts", validate_spot_attempts
+        )
+        return min((a for a in attempts if a is not None), default=None)
 
     def _resolve_retry_strategy(self) -> Optional[dict]:
         """The job's ``retryStrategy``, or ``None`` when spot attempts are unset.
@@ -679,6 +745,39 @@ class BatchJobBuilder:
                 "Remove --aws-batch-log-group or the pre-existing job definition."
             )
 
+    def _optional_submit_params(self) -> dict:
+        """SubmitJob's optional fields, shared by both submit paths.
+
+        Each field is present only when configured, so an unconfigured job's
+        submission carries none of them. The task timeout is not among them: the
+        dynamic path puts it on the registered job definition, and the
+        pre-existing definition path adds it itself. Resolving validates each
+        value it sends, so call this before registering a job definition.
+        """
+        params: dict[str, Any] = {}
+
+        tags = self._build_job_tags()
+        if tags:
+            params["tags"] = tags
+            # Propagate tags from the Batch job to the underlying ECS task so that
+            # cost-allocation tags reach the actual compute layer. Without this,
+            # tags are visible on the Batch job object but silently absent from the
+            # ECS task that incurs the billed EC2/ECS spend.
+            # Note: Batch tags the ECS task via its service role, so a custom Batch
+            # service role may need ecs:TagResource depending on the account's ECS
+            # tag-authorization settings.
+            params["propagateTags"] = True
+
+        priority = self._resolve_scheduling_priority()
+        if priority is not None:
+            params["schedulingPriorityOverride"] = priority
+
+        retry_strategy = self._resolve_retry_strategy()
+        if retry_strategy is not None:
+            params["retryStrategy"] = retry_strategy
+
+        return params
+
     def _submit_with_preexisting_definition(self, job_definition: str) -> dict:
         """Submit a job using a pre-existing definition via containerOverrides.
 
@@ -744,34 +843,14 @@ class BatchJobBuilder:
             "containerOverrides": container_overrides,
         }
 
-        tags = self._build_job_tags()
-        if tags:
-            job_params["tags"] = tags
-            # Propagate tags from the Batch job to the underlying ECS task so that
-            # cost-allocation tags reach the actual compute layer. Without this,
-            # tags are visible on the Batch job object but silently absent from the
-            # ECS task that incurs the billed EC2/ECS spend.
-            # Note: Batch tags the ECS task via its service role, so a custom Batch
-            # service role may need ecs:TagResource depending on the account's ECS
-            # tag-authorization settings.
-            job_params["propagateTags"] = True
-
-        # Mirror the optional kwargs from the dynamic path. The dynamic path bakes
-        # the timeout into the registered definition; here we have no definition to
-        # register, so the timeout travels as SubmitJob's top-level `timeout`
-        # field, which overrides any timeout on the pre-existing definition.
-        # Scheduling priority applies equally to pre-existing definitions.
+        job_params.update(self._optional_submit_params())
+        # The dynamic path bakes the timeout into the registered definition; here
+        # there is no definition to register, so the timeout travels as SubmitJob's
+        # top-level `timeout` field, which overrides any timeout on the pre-existing
+        # definition.
         task_timeout = self._resolve_task_timeout()
         if task_timeout is not None:
             job_params["timeout"] = {"attemptDurationSeconds": task_timeout}
-
-        priority = self._resolve_scheduling_priority()
-        if priority is not None:
-            job_params["schedulingPriorityOverride"] = priority
-
-        retry_strategy = self._resolve_retry_strategy()
-        if retry_strategy is not None:
-            job_params["retryStrategy"] = retry_strategy
 
         try:
             submitted = self.batch_client.submit_job(**job_params)
@@ -785,9 +864,11 @@ class BatchJobBuilder:
         if preexisting:
             return self._submit_with_preexisting_definition(preexisting)
 
-        # Validate before registering a job definition, which an invalid value
-        # would otherwise leave behind (nothing deregisters an unsubmitted one).
-        retry_strategy = self._resolve_retry_strategy()
+        # Resolved (and so validated) before registering a job definition, which
+        # an invalid value would otherwise leave behind: nothing deregisters an
+        # unsubmitted one. The timeout goes on the definition, and
+        # build_job_definition validates it before registering.
+        optional_params = self._optional_submit_params()
 
         job_def, job_name = self.build_job_definition()
 
@@ -797,26 +878,8 @@ class BatchJobBuilder:
             "jobDefinition": "{}:{}".format(
                 job_def["jobDefinitionName"], job_def["revision"]
             ),
+            **optional_params,
         }
-
-        tags = self._build_job_tags()
-        if tags:
-            job_params["tags"] = tags
-            # Propagate tags from the Batch job to the underlying ECS task so that
-            # cost-allocation tags reach the actual compute layer. Without this,
-            # tags are visible on the Batch job object but silently absent from the
-            # ECS task that incurs the billed EC2/ECS spend.
-            # Note: Batch tags the ECS task via its service role, so a custom Batch
-            # service role may need ecs:TagResource depending on the account's ECS
-            # tag-authorization settings.
-            job_params["propagateTags"] = True
-
-        priority = self._resolve_scheduling_priority()
-        if priority is not None:
-            job_params["schedulingPriorityOverride"] = priority
-
-        if retry_strategy is not None:
-            job_params["retryStrategy"] = retry_strategy
 
         try:
             submitted = self.batch_client.submit_job(**job_params)

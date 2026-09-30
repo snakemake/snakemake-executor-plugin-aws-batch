@@ -22,6 +22,9 @@ from snakemake_executor_plugin_aws_batch.batch_job_builder import (
     MAX_RULE_NAME_LENGTH,
     TRUNCATION_SUFFIX,
     AWS_BATCH_MAX_NAME_LENGTH,
+    MAX_TASK_TIMEOUT,
+    _validate_int_range,
+    validate_task_timeout,
 )
 from snakemake_interface_executor_plugins.jobs import GroupJobExecutorInterface
 from snakemake_executor_plugin_aws_batch.constant import (
@@ -1182,22 +1185,30 @@ class TestSubmitSpotAttempts:
         assert submit_kwargs["retryStrategy"] == _expected_retry_strategy(3)
 
 
+# What Snakemake gives a group member's resource that is a function of inputs
+# that do not exist yet when the group is submitted.
+TBD = TBDString()
+
+
 def _group_of(*member_resources: dict) -> MagicMock:
-    """A group job whose members have the given resources. The group's own
-    resources are what Snakemake would give it: parallel members' ints summed."""
+    """A group job whose own resources are what Snakemake would give it: each
+    integer resource summed over the (parallel) members."""
     group = MagicMock(spec=GroupJobExecutorInterface)
     group.name = "test_group"
     group.threads = 1
-    group.jobs = [MagicMock(resources=dict(r)) for r in member_resources]
-    group.resources = {
-        "_cores": 1,
-        "mem_mb": 1024,
-        "aws_batch_spot_attempts": sum(
-            r.get("aws_batch_spot_attempts", 0)
-            for r in member_resources
-            if not isinstance(r.get("aws_batch_spot_attempts"), str)
-        ),
-    }
+    group.jobs = [MagicMock(resources=dict(r), threads=1) for r in member_resources]
+    for i, member in enumerate(group.jobs):
+        member.name = f"member_{i}"
+    group.resources = {"_cores": 1, "mem_mb": 1024}
+    for key in (
+        "aws_batch_task_timeout",
+        "aws_batch_scheduling_priority",
+        "aws_batch_spot_attempts",
+    ):
+        # Like Snakemake, the sum skips a member's not-yet-evaluable "<TBD>".
+        values = [r[key] for r in member_resources if key in r and r[key] != "<TBD>"]
+        if values:
+            group.resources[key] = sum(values)
     return group
 
 
@@ -1236,7 +1247,7 @@ class TestGroupSpotAttempts:
     def test_member_not_yet_evaluated_is_unset(self, setting, expected):
         builder = _make_builder_with_spot_attempts(setting_attempts=setting)
         builder.job = _group_of(
-            {"aws_batch_spot_attempts": 5}, {"aws_batch_spot_attempts": TBDString()}
+            {"aws_batch_spot_attempts": 5}, {"aws_batch_spot_attempts": TBD}
         )
         call_args = _run_submit_priority(builder)
         assert call_args.kwargs["retryStrategy"] == expected
@@ -1247,10 +1258,23 @@ class TestGroupSpotAttempts:
         call_args = _run_submit_priority(builder)
         assert "retryStrategy" not in call_args.kwargs
 
-    def test_invalid_member_value_raises(self):
+    @pytest.mark.parametrize(
+        "members, member",
+        [
+            ([{"aws_batch_spot_attempts": 0}, {}], "member_0"),
+            (
+                [{"aws_batch_spot_attempts": 2}, {"aws_batch_spot_attempts": 0}],
+                "member_1",
+            ),
+        ],
+    )
+    def test_invalid_member_value_raises(self, members, member):
         builder = _make_builder_with_spot_attempts()
-        builder.job = _group_of({"aws_batch_spot_attempts": 0}, {})
-        with pytest.raises(WorkflowError, match="aws_batch_spot_attempts resource 0"):
+        builder.job = _group_of(*members)
+        with pytest.raises(
+            WorkflowError,
+            match=rf"aws_batch_spot_attempts resource \(group member {member}\) 0",
+        ):
             _run_submit_priority(builder)
 
 
@@ -1280,6 +1304,451 @@ class TestSpotAttemptsSetting:
 
         with pytest.raises(WorkflowError, match=match):
             ExecutorSettings(spot_attempts=attempts)
+
+
+# ---------------------------------------------------------------------------
+# Tests for the shared integer validator (timeout, priority, spot attempts)
+# ---------------------------------------------------------------------------
+
+
+class TestValidateIntRange:
+    @pytest.mark.parametrize("value", [3, "3", 3.0, "3.0", " 3 "])
+    def test_accepts_whole_numbers(self, value):
+        result = _validate_int_range(value, "test setting", 1, 10)
+        assert result == 3
+        assert type(result) is int
+
+    @pytest.mark.parametrize(
+        "value",
+        # True is an int to Python and float(True).is_integer() is True, so a
+        # bool must be rejected before any numeric conversion.
+        [True, False, 3.5, "3.5", "three", "4h", None, [], float("inf"), float("nan")],
+    )
+    def test_rejects_non_integers(self, value):
+        with pytest.raises(WorkflowError, match=r"test setting .*must be an integer"):
+            _validate_int_range(value, "test setting", 0, 10)
+
+    def test_rejects_below_minimum_naming_the_unit(self):
+        with pytest.raises(
+            WorkflowError,
+            match=r"Invalid t resource 59: must be in range \[60, 100\] seconds",
+        ):
+            _validate_int_range(59, "t resource", 60, 100, unit="seconds")
+
+    @pytest.mark.parametrize("value", ["1e400", "-1e400", "inf", "nan"])
+    def test_rejects_non_finite_strings(self, value):
+        with pytest.raises(WorkflowError, match="must be an integer"):
+            _validate_int_range(value, "t", 60, 100)
+
+    @pytest.mark.parametrize("value", [-1, 11])
+    def test_rejects_outside_range(self, value):
+        with pytest.raises(WorkflowError, match=r"must be in range \[0, 10\]"):
+            _validate_int_range(value, "p setting", 0, 10)
+
+    def test_unit_is_named_for_a_non_integer(self):
+        with pytest.raises(WorkflowError, match="an integer number of seconds"):
+            _validate_int_range("4h", "t", 60, 100, unit="seconds")
+
+
+class TestValidateTaskTimeout:
+    """AWS Batch's timeout (attemptDurationSeconds) is a 32-bit Integer."""
+
+    @pytest.mark.parametrize("value", [60, MAX_TASK_TIMEOUT, str(MAX_TASK_TIMEOUT)])
+    def test_accepts_the_aws_limits(self, value):
+        assert validate_task_timeout(value, "t") == int(value)
+
+    @pytest.mark.parametrize("value", [59, MAX_TASK_TIMEOUT + 1, str(2**31)])
+    def test_rejects_outside_the_aws_limits(self, value):
+        with pytest.raises(
+            WorkflowError, match=r"must be in range \[60, 2147483647\] seconds"
+        ):
+            validate_task_timeout(value, "t")
+
+
+class TestIntSettingsValidatedAtStartup:
+    """--aws-batch-task-timeout and --aws-batch-scheduling-priority are validated
+    when the settings are built, like --aws-batch-spot-attempts."""
+
+    @staticmethod
+    def _settings(**kwargs):
+        from snakemake_executor_plugin_aws_batch import ExecutorSettings
+
+        return ExecutorSettings(**kwargs)
+
+    def test_unset_is_none(self):
+        settings = self._settings()
+        assert settings.task_timeout is None
+        assert settings.scheduling_priority is None
+
+    def test_valid_values_are_normalized_to_int(self):
+        settings = self._settings(task_timeout="3600", scheduling_priority=50.0)
+        assert settings.task_timeout == 3600
+        assert settings.scheduling_priority == 50
+        assert type(settings.scheduling_priority) is int
+
+    def test_zero_priority_is_kept(self):
+        assert self._settings(scheduling_priority=0).scheduling_priority == 0
+
+    @pytest.mark.parametrize(
+        "kwargs, match",
+        [
+            ({"task_timeout": 59}, r"--aws-batch-task-timeout setting 59: must be"),
+            (
+                {"task_timeout": 2**31},
+                r"--aws-batch-task-timeout setting 2147483648: must be in range",
+            ),
+            ({"task_timeout": True}, r"--aws-batch-task-timeout setting True"),
+            ({"task_timeout": 90.5}, r"--aws-batch-task-timeout setting 90\.5"),
+            ({"task_timeout": "4h"}, r"--aws-batch-task-timeout setting '4h'"),
+            (
+                {"scheduling_priority": -1},
+                r"--aws-batch-scheduling-priority setting -1: must be in range",
+            ),
+            (
+                {"scheduling_priority": 10000},
+                r"--aws-batch-scheduling-priority setting 10000: must be in range",
+            ),
+            (
+                {"scheduling_priority": True},
+                r"--aws-batch-scheduling-priority setting True",
+            ),
+            (
+                {"scheduling_priority": 2.5},
+                r"--aws-batch-scheduling-priority setting 2\.5",
+            ),
+            ({"spot_attempts": True}, r"--aws-batch-spot-attempts setting True"),
+            ({"spot_attempts": 2.5}, r"--aws-batch-spot-attempts setting 2\.5"),
+        ],
+    )
+    def test_invalid_value_raises_at_startup(self, kwargs, match):
+        with pytest.raises(WorkflowError, match=match):
+            self._settings(**kwargs)
+
+
+class TestPerRuleIntResourcesAcceptWholeNumbers:
+    @pytest.mark.parametrize(
+        "resource, value, expected",
+        [
+            ("aws_batch_scheduling_priority", 7.0, 7),
+            ("aws_batch_spot_attempts", "2", 2),
+        ],
+    )
+    def test_whole_number_resources_are_accepted(self, resource, value, expected):
+        builder = _make_builder_with_priority()
+        builder.settings.spot_attempts = None
+        builder.job.resources[resource] = value
+        kwargs = _run_submit_priority(builder).kwargs
+        if resource == "aws_batch_scheduling_priority":
+            assert kwargs["schedulingPriorityOverride"] == expected
+        else:
+            assert kwargs["retryStrategy"]["attempts"] == expected
+
+
+# ---------------------------------------------------------------------------
+# Tests for validation ordering: nothing is registered for an invalid value
+# ---------------------------------------------------------------------------
+
+
+class TestInvalidValuesDoNotLeakJobDefinitions:
+    """An invalid per-rule value must fail before register_job_definition, since
+    nothing deregisters a job definition whose job was never submitted."""
+
+    @pytest.mark.parametrize(
+        "resource, value",
+        [
+            ("aws_batch_task_timeout", True),
+            ("aws_batch_task_timeout", 30),
+            ("aws_batch_task_timeout", 2**31),
+            ("aws_batch_task_timeout", "4h"),
+            # Snakemake rounds a float resource before the plugin sees it, but
+            # not a string.
+            ("aws_batch_task_timeout", "3600.5"),
+            ("aws_batch_scheduling_priority", True),
+            ("aws_batch_scheduling_priority", 10000),
+            ("aws_batch_scheduling_priority", "high"),
+            ("aws_batch_scheduling_priority", "2.5"),
+            ("aws_batch_spot_attempts", True),
+            ("aws_batch_spot_attempts", 11),
+            ("aws_batch_spot_attempts", "2.5"),
+        ],
+    )
+    def test_invalid_resource_raises_and_registers_nothing(self, resource, value):
+        builder = _make_builder(tags=None)
+        builder.job.resources = dict(builder.job.resources, **{resource: value})
+        with pytest.raises(WorkflowError, match=rf"Invalid {resource} resource"):
+            builder.submit()
+        builder.batch_client.register_job_definition.assert_not_called()
+        builder.batch_client.submit_job.assert_not_called()
+
+    def test_priority_is_resolved_before_the_definition_is_built(self):
+        """Priority validation must not depend on build_job_definition failing
+        first: with build_job_definition succeeding, it still is never called."""
+        builder = _make_builder_with_priority(resource_priority=-5)
+        with patch.object(builder, "build_job_definition") as build:
+            with pytest.raises(WorkflowError, match="aws_batch_scheduling_priority"):
+                builder.submit()
+        build.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# Tests for the optional SubmitJob fields shared by both submit paths
+# ---------------------------------------------------------------------------
+
+
+def _submit_via(path: str, **settings) -> tuple[dict, dict | None]:
+    """Submit a job via the 'dynamic' or 'preexisting' job-definition path with
+    the given settings; return (submit_job kwargs, register kwargs or None)."""
+    if path == "dynamic":
+        builder = _make_builder(tags=None)
+        builder.batch_client.register_job_definition.return_value = _fake_job_def()
+    else:
+        builder = _make_builder_with_preexisting(job_definition="my-job-def")
+    for key, value in settings.items():
+        setattr(builder.settings, key, value)
+    builder.batch_client.submit_job.return_value = {
+        "jobName": "snakejob-test",
+        "jobId": "abc-123",
+    }
+    builder.submit()
+    register = builder.batch_client.register_job_definition.call_args
+    return (
+        builder.batch_client.submit_job.call_args.kwargs,
+        register.kwargs if register else None,
+    )
+
+
+class TestOptionalSubmitParamsOnBothPaths:
+    ALL_SET = dict(
+        tags={"Project": "p1"},
+        task_timeout=900,
+        scheduling_priority=42,
+        spot_attempts=3,
+    )
+
+    @pytest.mark.parametrize("path", ["dynamic", "preexisting"])
+    def test_every_optional_field_is_sent(self, path):
+        submit_kwargs, _ = _submit_via(path, **self.ALL_SET)
+        assert submit_kwargs["tags"] == {"Project": "p1"}
+        assert submit_kwargs["propagateTags"] is True
+        assert submit_kwargs["schedulingPriorityOverride"] == 42
+        assert submit_kwargs["retryStrategy"] == _expected_retry_strategy(3)
+
+    @pytest.mark.parametrize("path", ["dynamic", "preexisting"])
+    def test_no_optional_field_when_unset(self, path):
+        submit_kwargs, _ = _submit_via(
+            path,
+            tags=None,
+            task_timeout=None,
+            scheduling_priority=None,
+            spot_attempts=None,
+        )
+        for key in (
+            "tags",
+            "propagateTags",
+            "timeout",
+            "schedulingPriorityOverride",
+            "retryStrategy",
+        ):
+            assert key not in submit_kwargs
+
+    def test_dynamic_path_puts_the_timeout_on_the_definition(self):
+        submit_kwargs, register_kwargs = _submit_via("dynamic", **self.ALL_SET)
+        assert "timeout" not in submit_kwargs
+        assert register_kwargs["timeout"] == {"attemptDurationSeconds": 900}
+
+    def test_preexisting_path_puts_the_timeout_on_submit_job(self):
+        submit_kwargs, register_kwargs = _submit_via("preexisting", **self.ALL_SET)
+        assert register_kwargs is None
+        assert submit_kwargs["timeout"] == {"attemptDurationSeconds": 900}
+
+
+# ---------------------------------------------------------------------------
+# Tests for group jobs: timeout and priority are read per member
+# ---------------------------------------------------------------------------
+
+
+class TestGroupTaskTimeout:
+    """A group job gets the sum of its members' timeouts, or none if any member
+    has none."""
+
+    @pytest.mark.parametrize(
+        "setting, members, expected",
+        [
+            # Members that run one after another each keep their own limit.
+            (None, [{"aws_batch_task_timeout": 600}] * 2, 1200),
+            (
+                None,
+                [{"aws_batch_task_timeout": 600}, {"aws_batch_task_timeout": 60}],
+                660,
+            ),
+            # Members without the resource fall back to the setting.
+            (300, [{}, {}], 600),
+            (300, [{"aws_batch_task_timeout": 3600}, {}], 3900),
+            # A member without any timeout leaves the group without one.
+            (None, [{"aws_batch_task_timeout": 600}, {}], None),
+            (None, [{}, {}], None),
+            # A member not yet evaluated ("<TBD>") falls back to the setting...
+            (
+                300,
+                [{"aws_batch_task_timeout": 600}, {"aws_batch_task_timeout": TBD}],
+                900,
+            ),
+            # ...and without one leaves the group without a timeout.
+            (
+                None,
+                [{"aws_batch_task_timeout": 600}, {"aws_batch_task_timeout": TBD}],
+                None,
+            ),
+        ],
+    )
+    def test_members_combine(self, setting, members, expected):
+        builder = _make_builder(tags=None)
+        builder.settings.task_timeout = setting
+        builder.job = _group_of(*members)
+        assert builder._resolve_task_timeout() == expected
+
+    def test_group_timeout_reaches_the_registered_definition(self):
+        builder = _make_builder(tags=None)
+        builder.settings.task_timeout = None
+        builder.job = _group_of(
+            {"aws_batch_task_timeout": 600}, {"aws_batch_task_timeout": 900}
+        )
+        builder.build_job_definition()
+        register_kwargs = builder.batch_client.register_job_definition.call_args.kwargs
+        assert register_kwargs["timeout"] == {"attemptDurationSeconds": 1500}
+
+    def test_single_member_group_gets_its_member_timeout(self):
+        builder = _make_builder(tags=None)
+        builder.job = _group_of({"aws_batch_task_timeout": 600})
+        assert builder._resolve_task_timeout() == 600
+
+    def test_empty_group_has_no_timeout(self):
+        # sum([]) is 0, which AWS Batch would reject as a timeout.
+        builder = _make_builder(tags=None)
+        builder.job = _group_of()
+        assert builder._resolve_task_timeout() is None
+
+    def test_group_timeout_reaches_submit_job_on_the_preexisting_path(self):
+        builder = _make_builder_with_preexisting()
+        builder.job = _group_of(
+            {"aws_batch_task_timeout": 600}, {"aws_batch_task_timeout": 900}
+        )
+        builder.batch_client.submit_job.return_value = {"jobId": "abc-123"}
+        builder.submit()
+        submit_kwargs = builder.batch_client.submit_job.call_args.kwargs
+        assert submit_kwargs["timeout"] == {"attemptDurationSeconds": 1500}
+
+    @pytest.mark.parametrize(
+        "members, match",
+        [
+            # Summed, the group's own resources would give a valid 60.
+            ([{"aws_batch_task_timeout": 30}] * 2, r"\(group member member_0\) 30"),
+            (
+                [{"aws_batch_task_timeout": 600}, {"aws_batch_task_timeout": 30}],
+                r"\(group member member_1\) 30",
+            ),
+        ],
+    )
+    def test_invalid_member_value_raises_before_registering(self, members, match):
+        builder = _make_builder(tags=None)
+        builder.job = _group_of(*members)
+        with pytest.raises(
+            WorkflowError, match="aws_batch_task_timeout resource " + match
+        ):
+            builder.submit()
+        builder.batch_client.register_job_definition.assert_not_called()
+
+    def test_sum_above_the_aws_maximum_raises_naming_the_group(self):
+        builder = _make_builder(tags=None)
+        builder.job = _group_of({"aws_batch_task_timeout": MAX_TASK_TIMEOUT}, {})
+        builder.settings.task_timeout = 60
+        with pytest.raises(
+            WorkflowError,
+            match=r"group job test_group: .* 2147483707 seconds, exceeds",
+        ):
+            builder.submit()
+        builder.batch_client.register_job_definition.assert_not_called()
+
+
+class TestGroupSchedulingPriority:
+    """A group job gets the highest of its members' priorities."""
+
+    @pytest.mark.parametrize(
+        "setting, members, expected",
+        [
+            # Summed, 12000 would be out of range and stop the workflow.
+            (None, [{"aws_batch_scheduling_priority": 6000}] * 2, 6000),
+            (
+                None,
+                [
+                    {"aws_batch_scheduling_priority": 10},
+                    {"aws_batch_scheduling_priority": 90},
+                ],
+                90,
+            ),
+            # Members without a priority are ignored.
+            (None, [{"aws_batch_scheduling_priority": 5}, {}], 5),
+            # Members without the resource fall back to the setting.
+            (50, [{"aws_batch_scheduling_priority": 5}, {}], 50),
+            (50, [{}, {}], 50),
+            (None, [{}, {}], None),
+            # Zero is a priority, not "unset".
+            (None, [{"aws_batch_scheduling_priority": 0}] * 2, 0),
+            # A single member's priority is the group's.
+            (50, [{"aws_batch_scheduling_priority": 7}], 7),
+            # A member not yet evaluated ("<TBD>") falls back to the setting...
+            (
+                50,
+                [
+                    {"aws_batch_scheduling_priority": 7},
+                    {"aws_batch_scheduling_priority": TBD},
+                ],
+                50,
+            ),
+            # ...and without one is ignored.
+            (
+                None,
+                [
+                    {"aws_batch_scheduling_priority": 7},
+                    {"aws_batch_scheduling_priority": TBD},
+                ],
+                7,
+            ),
+        ],
+    )
+    def test_members_combine(self, setting, members, expected):
+        builder = _make_builder_with_priority(setting_priority=setting)
+        builder.job = _group_of(*members)
+        kwargs = _run_submit_priority(builder).kwargs
+        if expected is None:
+            assert "schedulingPriorityOverride" not in kwargs
+        else:
+            assert kwargs["schedulingPriorityOverride"] == expected
+
+    @pytest.mark.parametrize(
+        "members, member",
+        [
+            ([{"aws_batch_scheduling_priority": -1}, {}], "member_0"),
+            (
+                [
+                    {"aws_batch_scheduling_priority": 5},
+                    {"aws_batch_scheduling_priority": -1},
+                ],
+                "member_1",
+            ),
+        ],
+    )
+    def test_invalid_member_value_raises(self, members, member):
+        builder = _make_builder_with_priority()
+        builder.job = _group_of(*members)
+        with pytest.raises(
+            WorkflowError,
+            match=(
+                r"aws_batch_scheduling_priority resource "
+                rf"\(group member {member}\) -1"
+            ),
+        ):
+            _run_submit_priority(builder)
 
 
 # ---------------------------------------------------------------------------
