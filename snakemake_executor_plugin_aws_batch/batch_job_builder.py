@@ -3,7 +3,10 @@ import uuid
 from typing import Any, List, Optional
 from botocore.exceptions import ClientError
 from snakemake_interface_common.exceptions import WorkflowError
-from snakemake_interface_executor_plugins.jobs import JobExecutorInterface
+from snakemake_interface_executor_plugins.jobs import (
+    GroupJobExecutorInterface,
+    JobExecutorInterface,
+)
 from snakemake_executor_plugin_aws_batch.batch_client import BatchClient
 from snakemake_executor_plugin_aws_batch.constant import (
     VALID_RESOURCES_MAPPING,
@@ -13,6 +16,40 @@ from snakemake_executor_plugin_aws_batch.constant import (
 )
 
 SNAKEMAKE_AWS_BATCH_JOB_TAGS_ENV_VAR = "SNAKEMAKE_AWS_BATCH_JOB_TAGS"
+
+# The statusReason AWS Batch gives a job whose EC2 host was terminated, e.g. a
+# reclaimed Spot instance: "Host EC2 (instance i-...) terminated."
+HOST_TERMINATED_STATUS_REASON = "Host EC2*"
+
+# The value Snakemake gives a resource it cannot evaluate yet: a group job's
+# member whose resource is a callable of inputs that do not exist yet arrives
+# at submit time as this placeholder string (snakemake's ``TBDString``).
+TBD_RESOURCE_VALUE = "<TBD>"
+
+
+def _is_tbd(value: Any) -> bool:
+    """Whether ``value`` is Snakemake's not-yet-evaluable resource placeholder."""
+    return isinstance(value, str) and value == TBD_RESOURCE_VALUE
+
+
+def validate_spot_attempts(attempts: Any, source: str) -> int:
+    """``attempts`` as an int in AWS Batch's retryStrategy range [1, 10].
+
+    ``source`` names where the value came from, for the error. Raises
+    ``WorkflowError`` for a non-integer or out-of-range value.
+    """
+    try:
+        attempts_int = int(attempts)
+    except (TypeError, ValueError) as e:
+        raise WorkflowError(
+            f"Invalid {source} {attempts!r}: must be an integer."
+        ) from e
+    if not (1 <= attempts_int <= 10):
+        raise WorkflowError(
+            f"Invalid {source} {attempts_int}: "
+            "must be in range [1, 10] (the AWS Batch limit)."
+        )
+    return attempts_int
 
 
 class BatchJobBuilder:
@@ -445,6 +482,68 @@ class BatchJobBuilder:
             )
         return priority_int
 
+    def _resolve_spot_attempts(self) -> Optional[int]:
+        """Resolve the effective attempts for a host-terminated job, or ``None``.
+
+        The per-rule ``aws_batch_spot_attempts`` resource takes precedence over
+        the workflow-level ``spot_attempts`` setting. Returns ``None`` when neither
+        is set so the ``retryStrategy`` kwarg can be omitted entirely. Raises
+        ``WorkflowError`` for non-integer values or values outside AWS's 1-10.
+
+        A group job runs as one Batch job, so it gets the smallest of its member
+        jobs' values: a member that opts out (1) opts the group out. Its own
+        ``resources`` would not do: Snakemake sums a group's integer resources
+        across members that run in parallel. A member whose resource Snakemake
+        cannot evaluate yet (``<TBD>``) counts as not setting it, so it falls
+        back to the setting.
+        """
+        if isinstance(self.job, GroupJobExecutorInterface):
+            member_attempts = [
+                attempts
+                for attempts in map(self._job_spot_attempts, self.job.jobs)
+                if attempts is not None
+            ]
+            return min(member_attempts, default=None)
+        return self._job_spot_attempts(self.job)
+
+    def _job_spot_attempts(self, job: JobExecutorInterface) -> Optional[int]:
+        """One (non-group) job's spot attempts, or ``None``; see
+        ``_resolve_spot_attempts``."""
+        resource_attempts = job.resources.get("aws_batch_spot_attempts")
+        if _is_tbd(resource_attempts):
+            resource_attempts = None
+        setting_attempts = getattr(self.settings, "spot_attempts", None)
+        if resource_attempts is not None:
+            attempts = resource_attempts
+            attempts_source = "aws_batch_spot_attempts resource"
+        elif setting_attempts is not None:
+            attempts = setting_attempts
+            attempts_source = "--aws-batch-spot-attempts setting"
+        else:
+            return None
+        return validate_spot_attempts(attempts, attempts_source)
+
+    def _resolve_retry_strategy(self) -> Optional[dict]:
+        """The job's ``retryStrategy``, or ``None`` when spot attempts are unset.
+
+        Retries only a job whose EC2 host was terminated (a reclaimed Spot
+        instance), inside the same Batch job. Every other failure exits, so it
+        reaches Snakemake, whose ``--retries`` handles it as before. The EXIT
+        entry is required: AWS Batch retries a job that matches no entry. Set on
+        ``SubmitJob``, where it overrides any retryStrategy on the definition, so
+        it applies to pre-existing job definitions too.
+        """
+        attempts = self._resolve_spot_attempts()
+        if attempts is None:
+            return None
+        return {
+            "attempts": attempts,
+            "evaluateOnExit": [
+                {"onStatusReason": HOST_TERMINATED_STATUS_REASON, "action": "RETRY"},
+                {"onReason": "*", "action": "EXIT"},
+            ],
+        }
+
     def _resolve_preexisting_job_definition(self) -> Optional[str]:
         """Return the effective pre-existing job definition name/ARN, or None.
 
@@ -576,6 +675,10 @@ class BatchJobBuilder:
         if priority is not None:
             job_params["schedulingPriorityOverride"] = priority
 
+        retry_strategy = self._resolve_retry_strategy()
+        if retry_strategy is not None:
+            job_params["retryStrategy"] = retry_strategy
+
         try:
             submitted = self.batch_client.submit_job(**job_params)
             submitted["_preexisting_job_definition"] = True
@@ -587,6 +690,10 @@ class BatchJobBuilder:
         preexisting = self._resolve_preexisting_job_definition()
         if preexisting:
             return self._submit_with_preexisting_definition(preexisting)
+
+        # Validate before registering a job definition, which an invalid value
+        # would otherwise leave behind (nothing deregisters an unsubmitted one).
+        retry_strategy = self._resolve_retry_strategy()
 
         job_def, job_name = self.build_job_definition()
 
@@ -613,6 +720,9 @@ class BatchJobBuilder:
         priority = self._resolve_scheduling_priority()
         if priority is not None:
             job_params["schedulingPriorityOverride"] = priority
+
+        if retry_strategy is not None:
+            job_params["retryStrategy"] = retry_strategy
 
         try:
             submitted = self.batch_client.submit_job(**job_params)

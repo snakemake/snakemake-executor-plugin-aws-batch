@@ -11,7 +11,10 @@ import boto3
 from botocore.exceptions import ClientError
 
 from snakemake_executor_plugin_aws_batch.batch_client import BatchClient
-from snakemake_executor_plugin_aws_batch.batch_job_builder import BatchJobBuilder
+from snakemake_executor_plugin_aws_batch.batch_job_builder import (
+    BatchJobBuilder,
+    validate_spot_attempts,
+)
 from snakemake_executor_plugin_aws_batch.constant import FATAL_BATCH_STATUSES
 from snakemake_interface_executor_plugins.executors.base import SubmittedJobInfo
 from snakemake_interface_executor_plugins.executors.remote import RemoteExecutor
@@ -108,6 +111,23 @@ class ExecutorSettings(ExecutorSettingsBase):
             "required": False,
         },
     )
+    spot_attempts: Optional[int] = field(
+        default=None,
+        metadata={
+            "help": (
+                "Attempts AWS Batch makes at a job whose EC2 host is terminated, "
+                "e.g. a reclaimed Spot instance (retryStrategy, 1-10). Batch retries "
+                "only a host termination, inside the same Batch job; any other "
+                "failure ends the job, and Snakemake's --retries applies to it as "
+                "before. Unset, the plugin sends no retryStrategy (a pre-existing job "
+                "definition's own, if any, applies) and a host termination fails the "
+                "job like any other failure. Per-rule overrides via the "
+                "aws_batch_spot_attempts resource take precedence."
+            ),
+            "env_var": False,
+            "required": False,
+        },
+    )
     job_definition: Optional[str] = field(
         default=None,
         metadata={
@@ -125,6 +145,14 @@ class ExecutorSettings(ExecutorSettingsBase):
             "required": False,
         },
     )
+
+    def __post_init__(self):
+        # Fail at startup, not at the first submit, on an invalid value (a
+        # per-rule aws_batch_spot_attempts resource is checked at submit).
+        if self.spot_attempts is not None:
+            self.spot_attempts = validate_spot_attempts(
+                self.spot_attempts, "--aws-batch-spot-attempts setting"
+            )
 
 
 # Required:
