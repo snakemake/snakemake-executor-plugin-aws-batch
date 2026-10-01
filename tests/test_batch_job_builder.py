@@ -22,6 +22,7 @@ from snakemake_interface_executor_plugins.jobs import GroupJobExecutorInterface
 from snakemake_executor_plugin_aws_batch.constant import (
     BATCH_JOB_PLATFORM_CAPABILITIES,
 )
+from snakemake_executor_plugin_aws_batch.image_map import ImageMap
 
 
 # ---------------------------------------------------------------------------
@@ -1245,11 +1246,11 @@ class TestSpotAttemptsSetting:
 # ---------------------------------------------------------------------------
 
 
-def _run_job_capture_container_image(
-    resources: dict, global_image: str = "global-image:latest"
-) -> str:
+def _run_job(
+    resources: dict, global_image: str = "global-image:latest", image_map=None
+):
     """Call Executor.run_job with the given job.resources (BatchJobBuilder mocked)
-    and return the container_image it passed to BatchJobBuilder."""
+    and return the executor and the BatchJobBuilder mock."""
     from snakemake_executor_plugin_aws_batch import Executor
 
     executor = object.__new__(Executor)
@@ -1259,11 +1260,14 @@ def _run_job_capture_container_image(
         job_queue="test-queue", job_role="test-role", tags=None, task_timeout=None
     )
     executor.container_image = global_image
+    executor.image_map = image_map
     executor.envvars = MagicMock(return_value={})
     executor.format_job_exec = MagicMock(return_value="snakemake ...")
     executor.report_job_submission = MagicMock()
+    executor.report_job_error = MagicMock()
 
     job = MagicMock()
+    job.name = "rule_a"
     job.resources = resources
 
     with patch("snakemake_executor_plugin_aws_batch.BatchJobBuilder") as mock_cls:
@@ -1275,6 +1279,15 @@ def _run_job_capture_container_image(
         }
         instance.job_queue = "test-queue"
         executor.run_job(job)
+    return executor, mock_cls
+
+
+def _run_job_capture_container_image(
+    resources: dict, global_image: str = "global-image:latest", image_map=None
+) -> str:
+    """Call Executor.run_job with the given job.resources (BatchJobBuilder mocked)
+    and return the container_image it passed to BatchJobBuilder."""
+    _, mock_cls = _run_job(resources, global_image, image_map)
     return mock_cls.call_args.kwargs["container_image"]
 
 
@@ -1292,6 +1305,55 @@ class TestRunJobContainerImage:
         """With no per-rule resource, run_job must use the global container image."""
         image = _run_job_capture_container_image({})
         assert image == "global-image:latest"
+
+    def test_the_image_map_replaces_rule_and_global_images(self):
+        """With an image map, the rule's and the global image run their mapped one."""
+        image_map = ImageMap(
+            {
+                "rule-image:v2": "registry.example/rule@sha256:1",
+                "global-image:latest": "g",
+            }
+        )
+        rule = {"aws_batch_container_image": "rule-image:v2"}
+        assert (
+            _run_job_capture_container_image(rule, image_map=image_map)
+            == "registry.example/rule@sha256:1"
+        )
+        assert _run_job_capture_container_image({}, image_map=image_map) == "g"
+
+    def test_an_image_missing_from_the_map_fails_the_job(self):
+        """A job whose image is not in the map fails without being submitted."""
+        executor, mock_cls = _run_job(
+            {"aws_batch_container_image": "other:1"},
+            image_map=ImageMap({"global-image:latest": "g"}),
+        )
+        mock_cls.assert_not_called()
+        executor.report_job_submission.assert_not_called()
+        executor.report_job_error.assert_called_once()
+        job_info = executor.report_job_error.call_args.args[0]
+        assert job_info.job.name == "rule_a"
+        assert executor.report_job_error.call_args.kwargs["msg"].startswith(
+            "rule_a: container image 'other:1' is not in the container image map"
+        )
+
+    def test_a_per_rule_job_definition_with_the_map_fails_the_job(self):
+        """The map cannot check a pre-existing definition's image, so the job fails."""
+        executor, mock_cls = _run_job(
+            {"aws_batch_job_definition": "my-def:3"},
+            image_map=ImageMap({"global-image:latest": "g"}),
+        )
+        mock_cls.assert_not_called()
+        executor.report_job_submission.assert_not_called()
+        msg = executor.report_job_error.call_args.kwargs["msg"]
+        assert msg.startswith(
+            "rule_a: cannot run on the pre-existing job definition 'my-def:3'"
+        )
+
+    def test_a_per_rule_job_definition_without_the_map_is_submitted(self):
+        """Without a map, a per-rule job definition is left to BatchJobBuilder."""
+        executor, mock_cls = _run_job({"aws_batch_job_definition": "my-def:3"})
+        mock_cls.assert_called_once()
+        executor.report_job_error.assert_not_called()
 
 
 # ---------------------------------------------------------------------------

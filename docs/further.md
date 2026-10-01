@@ -160,6 +160,40 @@ below): the worker runs `snakemake` inside the container, so the image must have
 Snakemake and a compatible storage plugin installed. A plain tool image that does
 not include Snakemake will fail to launch the job.
 
+# Container Image Map
+
+A deployment that copies every image a workflow uses into its own registry (for example,
+pinned by digest in a private ECR repository) can make jobs run those copies without
+editing the workflow. Pass a JSON object mapping image references to the images to run:
+
+```json
+{
+  "quay.io/biocontainers/samtools:1.21--h50ea8bc_0": "123456789012.dkr.ecr.us-east-1.amazonaws.com/tools@sha256:…",
+  "my-custom-image:tag": "123456789012.dkr.ecr.us-east-1.amazonaws.com/custom@sha256:…"
+}
+```
+
+```console
+snakemake --executor aws-batch --aws-batch-container-image-map images.json ...
+# or: SNAKEMAKE_AWS_BATCH_CONTAINER_IMAGE_MAP=images.json
+```
+
+Every job's image, whether the global `--container-image` or a rule's
+`aws_batch_container_image` (including one computed by a function), is looked up in the
+map as written and then in its normalized form: `ubuntu` is
+`docker.io/library/ubuntu:latest`, registry names are case-insensitive, and a reference
+with a digest matches with or without a tag. The map is strict: a job whose image is not
+in it fails without being submitted, like any other failed job (jobs already running
+finish, and `--keep-going` and `--retries` apply), so no job pulls an image the
+deployment has not copied. To let an image through unchanged, map it to itself.
+
+A map that names an image twice, or maps two spellings of one image to different images
+without an entry for the normalized spelling, is refused at startup.
+
+The map cannot check the image of a [pre-existing job definition](#pre-existing-job-definitions),
+so it cannot be combined with `--aws-batch-job-definition` (refused at startup) or the
+per-rule `aws_batch_job_definition` resource (that job fails).
+
 # Example
 
 ## Create environment
@@ -425,6 +459,8 @@ definition:
 The `--aws-batch-container-image` (`container_image`) setting and the per-rule
 `aws_batch_container_image` resource are both silently ignored in this mode — the
 container image is taken from the pre-existing definition.
+For the same reason a [container image map](#container-image-map) cannot be used with a
+pre-existing definition.
 
 Task timeout, scheduling priority and spot attempts **are** still honored:
 `--aws-batch-task-timeout` (and the per-rule `aws_batch_task_timeout` resource),
