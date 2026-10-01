@@ -6,6 +6,7 @@ mocked AWS clients — no AWS credentials required.
 """
 
 import os
+import re
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
@@ -33,7 +34,7 @@ from snakemake_executor_plugin_aws_batch.constant import (
 # ---------------------------------------------------------------------------
 
 
-def _make_builder(tags=None) -> BatchJobBuilder:
+def _make_builder(tags=None, name="test_rule") -> BatchJobBuilder:
     """Return a BatchJobBuilder with minimal mocks.
 
     The batch_client is fully mocked so no AWS calls are made.  build_job_definition
@@ -53,7 +54,7 @@ def _make_builder(tags=None) -> BatchJobBuilder:
 
     logger = MagicMock()
     job = MagicMock()
-    job.name = "test_rule"
+    job.name = name
     job.threads = 1
     job.resources = {"_cores": 1, "mem_mb": 1024}
 
@@ -1834,6 +1835,8 @@ class TestBuildJobDefinitionJobRole:
 # Tests for _sanitize_job_name
 # ---------------------------------------------------------------------------
 
+_UUID_PATTERN = r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}"
+
 
 class TestSanitizeJobName:
     """Tests for the _sanitize_job_name helper function."""
@@ -1853,6 +1856,12 @@ class TestSanitizeJobName:
         # Multiple invalid chars
         assert _sanitize_job_name("a.b:c/d") == "a_b_c_d"
 
+    def test_non_ascii_characters_replaced(self):
+        """Non-ASCII letters (valid in Snakemake rule names) should be replaced."""
+        assert _sanitize_job_name("règle") == "r_gle"
+        assert _sanitize_job_name("ñame_1") == "ame_1"
+        assert _sanitize_job_name("数据") == "job"
+
     def test_multiple_underscores_collapsed(self):
         """Multiple consecutive underscores should be collapsed to one."""
         assert _sanitize_job_name("rule__name") == "rule_name"
@@ -1868,25 +1877,21 @@ class TestSanitizeJobName:
         """Names exceeding max length should be truncated with suffix."""
         long_name = "a" * 100
         result = _sanitize_job_name(long_name)
-        assert len(result) == MAX_RULE_NAME_LENGTH
-        # Should be truncated with suffix
-        assert result.endswith(TRUNCATION_SUFFIX)
         expected = (
             "a" * (MAX_RULE_NAME_LENGTH - len(TRUNCATION_SUFFIX)) + TRUNCATION_SUFFIX
         )
         assert result == expected
+        assert len(result) == MAX_RULE_NAME_LENGTH
 
-    def test_truncation_strips_trailing_separator(self):
-        """Truncation should not leave trailing underscores or hyphens before suffix."""
-        # Create a name that would have _ at truncation point
-        name = "a" * 75 + "_b" * 20
+    @pytest.mark.parametrize("separator", ["_", "-", "."])
+    def test_truncation_strips_trailing_separator(self, separator):
+        """Truncation should not leave a trailing separator before the suffix."""
+        # Place the separator at the last position kept by truncation
+        stem = "a" * (MAX_RULE_NAME_LENGTH - len(TRUNCATION_SUFFIX) - 1)
+        name = stem + separator + "b" * 10
         result = _sanitize_job_name(name)
-        assert len(result) <= MAX_RULE_NAME_LENGTH + len(TRUNCATION_SUFFIX)
-        assert result.endswith(TRUNCATION_SUFFIX)
-        # Check no trailing separator before the suffix
-        without_suffix = result[: -len(TRUNCATION_SUFFIX)]
-        assert not without_suffix.endswith("_")
-        assert not without_suffix.endswith("-")
+        assert result == stem + TRUNCATION_SUFFIX
+        assert len(result) <= MAX_RULE_NAME_LENGTH
 
     def test_empty_name_returns_job(self):
         """Empty or all-invalid names should return 'job' as fallback."""
@@ -1905,9 +1910,7 @@ class TestSanitizeJobName:
         """GroupJob names with '...' (from truncation) should be sanitized."""
         # Snakemake adds '...' when >5 rules in group
         name = "group_rule1_rule2_rule3_rule4_rule5_..."
-        result = _sanitize_job_name(name)
-        assert "..." not in result
-        assert "_" not in result[-1:]  # Should not end with _
+        assert _sanitize_job_name(name) == "group_rule1_rule2_rule3_rule4_rule5"
 
     def test_custom_max_length(self):
         """Custom max_length parameter should be respected."""
@@ -1916,6 +1919,12 @@ class TestSanitizeJobName:
         # 5 - 2 (suffix) = 3 chars + suffix
         assert result == "abc" + TRUNCATION_SUFFIX
         assert len(result) == 5
+
+    @pytest.mark.parametrize("max_length", [-1, 0, 1, len(TRUNCATION_SUFFIX)])
+    def test_max_length_too_small_raises(self, max_length):
+        """A max_length that cannot fit any name plus the suffix is rejected."""
+        with pytest.raises(ValueError, match="max_length must be greater than"):
+            _sanitize_job_name("abcdefghij", max_length=max_length)
 
 
 # ---------------------------------------------------------------------------
@@ -1928,51 +1937,34 @@ class TestBuildJobNamesIntegration:
 
     def _make_builder_with_name(self, job_name: str) -> BatchJobBuilder:
         """Create a builder with a custom job name for testing sanitization."""
-        settings = SimpleNamespace(
-            job_queue="test-queue",
-            job_role="arn:aws:iam::123456789:role/test-role",
-            tags=None,
-            task_timeout=None,
-            job_definition=None,
-        )
-        batch_client = MagicMock()
-        batch_client.describe_job_queues.return_value = {"jobQueues": []}
-        batch_client.register_job_definition.return_value = {
-            "jobDefinitionName": "snakejob-def-test",
-            "revision": 1,
-        }
-
-        job = MagicMock()
-        job.name = job_name
-        job.threads = 1
-        job.resources = {"_cores": 1, "mem_mb": 1024}
-
-        builder = BatchJobBuilder(
-            logger=MagicMock(),
-            job=job,
-            envvars={},
-            container_image="test-image:latest",
-            settings=settings,
-            job_command="snakemake ...",
-            batch_client=batch_client,
-        )
+        builder = _make_builder(name=job_name)
+        builder.batch_client.register_job_definition.return_value = _fake_job_def()
         # Force EC2 platform to avoid Fargate rejection
-        builder._platform = "EC2"
+        builder.platform = BATCH_JOB_PLATFORM_CAPABILITIES.EC2.value
         return builder
+
+    @staticmethod
+    def _registered_job_def_name(builder: BatchJobBuilder) -> str:
+        call_args = builder.batch_client.register_job_definition.call_args
+        return call_args.kwargs["jobDefinitionName"]
 
     def test_build_job_definition_sanitizes_dotted_name(self):
         """build_job_definition should sanitize job names with invalid characters."""
         builder = self._make_builder_with_name("rule.with.dots")
         job_def, job_name = builder.build_job_definition()
 
-        # Dots should be replaced with underscores
-        assert "." not in job_name
-        assert "rule_with_dots" in job_name
-        # Job definition name should also be sanitized
-        call_args = builder.batch_client.register_job_definition.call_args
-        job_def_name = call_args.kwargs["jobDefinitionName"]
-        assert "." not in job_def_name
-        assert "rule_with_dots" in job_def_name
+        assert re.fullmatch(f"snakejob-rule_with_dots-{_UUID_PATTERN}", job_name)
+        assert re.fullmatch(
+            f"snakejob-def-rule_with_dots-{_UUID_PATTERN}",
+            self._registered_job_def_name(builder),
+        )
+        builder.logger.debug.assert_called_once()
+
+    def test_build_job_definition_valid_name_not_logged(self):
+        """A name that needs no sanitization should not log a sanitization message."""
+        builder = self._make_builder_with_name("valid_rule")
+        builder.build_job_definition()
+        builder.logger.debug.assert_not_called()
 
     def test_build_job_definition_sanitizes_long_name(self):
         """build_job_definition should truncate overly long job names."""
@@ -1984,14 +1976,13 @@ class TestBuildJobNamesIntegration:
         expected_stem = (
             "a" * (MAX_RULE_NAME_LENGTH - len(TRUNCATION_SUFFIX)) + TRUNCATION_SUFFIX
         )
-        assert job_name.startswith(f"snakejob-{expected_stem}-")
-        assert len(job_name) <= AWS_BATCH_MAX_NAME_LENGTH
+        assert re.fullmatch(f"snakejob-{expected_stem}-{_UUID_PATTERN}", job_name)
         # The job definition name is the binding constraint (longer prefix)
-        job_def_name = builder.batch_client.register_job_definition.call_args.kwargs[
-            "jobDefinitionName"
-        ]
-        assert job_def_name.startswith(f"snakejob-def-{expected_stem}-")
-        assert len(job_def_name) <= AWS_BATCH_MAX_NAME_LENGTH
+        job_def_name = self._registered_job_def_name(builder)
+        assert re.fullmatch(
+            f"snakejob-def-{expected_stem}-{_UUID_PATTERN}", job_def_name
+        )
+        assert len(job_def_name) == AWS_BATCH_MAX_NAME_LENGTH
 
     def test_build_job_definition_exact_max_length_passes(self):
         """A rule name at exactly MAX_RULE_NAME_LENGTH should not be truncated."""
@@ -2000,16 +1991,12 @@ class TestBuildJobNamesIntegration:
         job_def, job_name = builder.build_job_definition()
 
         # Should NOT be truncated — no suffix appended
-        assert job_name.startswith(f"snakejob-{exact_name}-")
-        assert TRUNCATION_SUFFIX not in job_name
-        assert len(job_name) <= AWS_BATCH_MAX_NAME_LENGTH
-        # Job definition name should also pass without truncation
-        job_def_name = builder.batch_client.register_job_definition.call_args.kwargs[
-            "jobDefinitionName"
-        ]
-        assert job_def_name.startswith(f"snakejob-def-{exact_name}-")
-        assert TRUNCATION_SUFFIX not in job_def_name
-        assert len(job_def_name) <= AWS_BATCH_MAX_NAME_LENGTH
+        assert re.fullmatch(f"snakejob-{exact_name}-{_UUID_PATTERN}", job_name)
+        # The job definition name uses the full AWS Batch limit, so
+        # MAX_RULE_NAME_LENGTH is neither too long nor needlessly short.
+        job_def_name = self._registered_job_def_name(builder)
+        assert re.fullmatch(f"snakejob-def-{exact_name}-{_UUID_PATTERN}", job_def_name)
+        assert len(job_def_name) == AWS_BATCH_MAX_NAME_LENGTH
 
     def test_preexisting_path_sanitizes_dotted_name(self):
         """_submit_with_preexisting_definition should sanitize job names."""
@@ -2028,5 +2015,7 @@ class TestBuildJobNamesIntegration:
         # Check the jobName passed to submit_job
         call_args = builder.batch_client.submit_job.call_args
         submitted_job_name = call_args.kwargs["jobName"]
-        assert "." not in submitted_job_name
-        assert "rule_with_dots" in submitted_job_name
+        assert re.fullmatch(
+            f"snakejob-rule_with_dots-{_UUID_PATTERN}", submitted_job_name
+        )
+        builder.batch_client.register_job_definition.assert_not_called()
