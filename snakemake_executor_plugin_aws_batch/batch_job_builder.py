@@ -1,4 +1,5 @@
 import os
+import re
 import uuid
 from typing import Any, List, Optional
 from botocore.exceptions import ClientError
@@ -102,6 +103,60 @@ def build_job_tags(settings) -> dict:
     return tags
 
 
+# AWS Batch name constraints: job names and job definition names must be at
+# most 128 characters and contain only letters, numbers, hyphens, and
+# underscores (job names must also start with a letter or number).
+AWS_BATCH_MAX_NAME_LENGTH: int = 128
+_JOB_NAME_PREFIX: str = "snakejob-"
+_JOB_DEF_NAME_PREFIX: str = "snakejob-def-"
+# Length of str(uuid.uuid4()), which suffixes every job and job definition name
+_UUID_LENGTH: int = 36
+# Suffix to indicate name was truncated
+TRUNCATION_SUFFIX: str = "-x"
+# Max length of the sanitized rule name (including TRUNCATION_SUFFIX, if any).
+# The job definition name has the longer prefix, so it is the binding limit:
+# f"{_JOB_DEF_NAME_PREFIX}{name}-{uuid}" must fit in AWS_BATCH_MAX_NAME_LENGTH.
+MAX_RULE_NAME_LENGTH: int = (
+    AWS_BATCH_MAX_NAME_LENGTH - len(_JOB_DEF_NAME_PREFIX) - 1 - _UUID_LENGTH
+)
+
+
+def _sanitize_job_name(name: str, max_length: int = MAX_RULE_NAME_LENGTH) -> str:
+    """Sanitize a rule name for use in AWS Batch job and job definition names.
+
+    The result contains only ASCII letters, numbers, hyphens, and underscores,
+    does not start or end with a hyphen or underscore, and is at most
+    ``max_length`` characters. It is the stem of the names built by
+    ``BatchJobBuilder._build_job_names``, which adds the prefix and UUID.
+
+    When the sanitized name exceeds ``max_length``, it is truncated and
+    suffixed with ``TRUNCATION_SUFFIX`` to indicate truncation occurred.
+
+    Args:
+        name: The raw job/rule name from Snakemake
+        max_length: Maximum length for the sanitized name; must be greater
+            than ``len(TRUNCATION_SUFFIX)``
+
+    Returns:
+        Sanitized name safe for AWS Batch
+    """
+    if max_length <= len(TRUNCATION_SUFFIX):
+        raise ValueError(
+            f"max_length must be greater than {len(TRUNCATION_SUFFIX)}, "
+            f"got {max_length}"
+        )
+    # Replace runs of characters other than letters, numbers, and hyphens
+    # (including underscores) with a single underscore
+    sanitized = re.sub(r"[^a-zA-Z0-9-]+", "_", name)
+    # Strip leading/trailing underscores or hyphens
+    sanitized = sanitized.strip("_-")
+    # Truncate to max length and add suffix to indicate truncation
+    if len(sanitized) > max_length:
+        truncate_at = max_length - len(TRUNCATION_SUFFIX)
+        sanitized = sanitized[:truncate_at].rstrip("_-") + TRUNCATION_SUFFIX
+    return sanitized or "job"
+
+
 class BatchJobBuilder:
     def __init__(
         self,
@@ -154,6 +209,23 @@ class BatchJobBuilder:
         Return docker CMD form of the command
         """
         return ["/bin/bash", "-c", remote_command]
+
+    def _build_job_names(self) -> tuple[str, str]:
+        """Build sanitized job name and job definition name.
+
+        Returns:
+            A tuple of (job_name, job_definition_name) suitable for AWS Batch.
+        """
+        job_uuid = str(uuid.uuid4())
+        sanitized_name = _sanitize_job_name(self.job.name)
+        if sanitized_name != self.job.name:
+            self.logger.debug(
+                f"Sanitized job name {self.job.name!r} to {sanitized_name!r} "
+                f"for AWS Batch"
+            )
+        job_name = f"{_JOB_NAME_PREFIX}{sanitized_name}-{job_uuid}"
+        job_definition_name = f"{_JOB_DEF_NAME_PREFIX}{sanitized_name}-{job_uuid}"
+        return job_name, job_definition_name
 
     def _get_platform_from_queue(self) -> str:
         """
@@ -318,9 +390,7 @@ class BatchJobBuilder:
                 "own role."
             )
 
-        job_uuid = str(uuid.uuid4())
-        job_name = f"snakejob-{self.job.name}-{job_uuid}"
-        job_definition_name = f"snakejob-def-{self.job.name}-{job_uuid}"
+        job_name, job_definition_name = self._build_job_names()
 
         # Validate and convert resources
         gpu = max(0, int(self.job.resources.get("_gpus", 0)))
@@ -604,8 +674,7 @@ class BatchJobBuilder:
         """
         self._validate_preexisting_compatibility()
 
-        job_uuid = str(uuid.uuid4())
-        job_name = f"snakejob-{self.job.name}-{job_uuid}"
+        job_name, _ = self._build_job_names()
 
         gpu = max(0, int(self.job.resources.get("_gpus", 0)))
         vcpu = max(
