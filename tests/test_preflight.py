@@ -1,10 +1,10 @@
 """Unit tests for the executor's startup preflight validation.
 
-Covers ``_preflight_validate``, ``_queue_problems``, and ``_validate_job_role``:
-the best-effort checks run in ``__post_init__`` that fail fast on a definitively
-misconfigured job queue / compute environment / job role, but degrade to a
-no-op on uncertain state (a transient API error or a missing describe/iam
-permission).
+Covers ``_preflight_validate``, ``_queue_problems``, ``_validate_job_role``, and
+``_validate_log_group``: the best-effort checks run in ``__post_init__`` that fail
+fast on a definitively misconfigured job queue / compute environment / job role /
+log group, but degrade to a no-op on uncertain state (a transient API error or a
+missing describe/iam/logs permission).
 """
 
 import os
@@ -297,11 +297,13 @@ class TestQueueProblems:
 
 
 class TestPreflightValidate:
-    def test_healthy_passes_and_checks_role(self):
+    def test_healthy_passes_and_checks_role_and_log_group(self):
         ex = _with_queue(_executor(), _healthy_queue(), compute_envs=[_healthy_ce()])
         ex._validate_job_role = MagicMock()
+        ex._validate_log_group = MagicMock()
         ex._preflight_validate()  # must not raise
         ex._validate_job_role.assert_called_once()
+        ex._validate_log_group.assert_called_once()
 
     def test_queue_without_compute_environment_raises(self):
         ex = _with_queue(
@@ -615,4 +617,89 @@ class TestValidateJobRole:
         ex = _executor(job_role="bare-role-name")
         with patch("boto3.client") as mocked_client:
             ex._validate_job_role()
+            mocked_client.assert_not_called()
+
+
+class TestValidateLogGroup:
+    def _logs(self, names=None, side_effect=None) -> MagicMock:
+        describe = MagicMock(side_effect=side_effect)
+        if side_effect is None:
+            describe.return_value = {
+                "logGroups": [{"logGroupName": n} for n in names or []]
+            }
+        return MagicMock(describe_log_groups=describe)
+
+    def test_existing_group_passes(self):
+        ex = _executor(log_group="/snakemake/proj")
+        logs = self._logs(names=["/snakemake/proj"])
+        with patch("boto3.client", return_value=logs) as mocked_client:
+            ex._validate_log_group()  # must not raise
+        mocked_client.assert_called_once_with("logs", region_name="us-east-1")
+        logs.describe_log_groups.assert_called_once_with(
+            logGroupNamePrefix="/snakemake/proj", limit=1
+        )
+
+    def test_missing_group_raises(self):
+        # Results are ASCII-sorted, so a first result that only shares the prefix
+        # means the configured group does not exist.
+        ex = _executor(log_group="/snakemake/proj")
+        logs = self._logs(names=["/snakemake/proj-a"])
+        with patch("boto3.client", return_value=logs):
+            with pytest.raises(WorkflowError, match="does not exist: /snakemake/proj "):
+                ex._validate_log_group()
+
+    def test_no_groups_with_the_prefix_raises(self):
+        ex = _executor(log_group="/snakemake/proj")
+        logs = self._logs(names=[])
+        with patch("boto3.client", return_value=logs):
+            with pytest.raises(WorkflowError, match="does not exist"):
+                ex._validate_log_group()
+
+    @pytest.mark.parametrize(
+        "name",
+        [
+            "arn:aws:logs:us-east-1:123456789012:log-group:/snakemake/proj",
+            "/snakemake/my proj",
+            "/snakemake/proj\n",
+            "a" * 513,
+        ],
+    )
+    def test_malformed_name_raises_without_calling_aws(self, name):
+        ex = _executor(log_group=name)
+        with patch("boto3.client") as mocked_client:
+            with pytest.raises(WorkflowError, match="Invalid CloudWatch Logs group"):
+                ex._validate_log_group()
+            mocked_client.assert_not_called()
+
+    def test_longest_valid_name_is_checked_with_aws(self):
+        name = "a" * 512
+        ex = _executor(log_group=name)
+        logs = self._logs(names=[name])
+        with patch("boto3.client", return_value=logs):
+            ex._validate_log_group()  # must not raise
+        logs.describe_log_groups.assert_called_once()
+
+    def test_access_denied_degrades(self):
+        ex = _executor(log_group="/snakemake/proj")
+        logs = self._logs(
+            side_effect=ClientError(
+                {"Error": {"Code": "AccessDeniedException"}}, "DescribeLogGroups"
+            )
+        )
+        with patch("boto3.client", return_value=logs):
+            ex._validate_log_group()  # must not raise
+        ex.logger.warning.assert_called_once()
+        assert "AccessDeniedException" in ex.logger.warning.call_args.args[0]
+
+    def test_non_client_error_degrades(self):
+        ex = _executor(log_group="/snakemake/proj")
+        logs = self._logs(side_effect=RuntimeError("no credentials"))
+        with patch("boto3.client", return_value=logs):
+            ex._validate_log_group()  # must not raise
+        ex.logger.warning.assert_called_once()
+
+    def test_no_log_group_configured_is_noop(self):
+        ex = _executor()
+        with patch("boto3.client") as mocked_client:
+            ex._validate_log_group()
             mocked_client.assert_not_called()

@@ -3,6 +3,7 @@ __copyright__ = "Copyright 2025, Snakemake community"
 __email__ = "jake.vancampen7@gmail.com"
 __license__ = "MIT"
 
+import re
 import uuid
 from dataclasses import dataclass, field
 from pprint import pformat
@@ -15,7 +16,9 @@ from snakemake_executor_plugin_aws_batch.batch_client import BatchClient
 from snakemake_executor_plugin_aws_batch.batch_job_builder import (
     BatchJobBuilder,
     build_job_tags,
+    validate_scheduling_priority,
     validate_spot_attempts,
+    validate_task_timeout,
 )
 from snakemake_executor_plugin_aws_batch.constant import FATAL_BATCH_STATUSES
 from snakemake_interface_executor_plugins.executors.base import SubmittedJobInfo
@@ -28,6 +31,9 @@ from snakemake_interface_executor_plugins.jobs import (
     JobExecutorInterface,
 )
 from snakemake_interface_common.exceptions import WorkflowError
+
+# A CloudWatch Logs group name, as the awslogs driver's CreateLogStream accepts it.
+LOG_GROUP_NAME = re.compile(r"[.\-_/#A-Za-z0-9]{1,512}")
 
 
 def _is_access_denied(error: ClientError) -> bool:
@@ -105,7 +111,10 @@ class ExecutorSettings(ExecutorSettingsBase):
             "help": (
                 "Task timeout in seconds: AWS Batch terminates a job that does not "
                 "finish within this limit. Jobs have no timeout unless this is set. "
-                "When set, the value must be at least 60 (the AWS minimum)."
+                "When set, the value must be in range [60, 2147483647] (the AWS "
+                "Batch limits). Per-rule overrides via the aws_batch_task_timeout "
+                "resource take precedence. A group job gets the sum of its members' "
+                "timeouts, and none if any member has none."
             ),
             "env_var": False,
             "required": False,
@@ -116,10 +125,11 @@ class ExecutorSettings(ExecutorSettingsBase):
         metadata={
             "help": (
                 "Default scheduling priority applied to every submitted job "
-                "(schedulingPriorityOverride). Only meaningful on fair-share job "
-                "queues, i.e. queues with a scheduling policy attached; ignored "
-                "otherwise. Per-rule overrides via the "
-                "aws_batch_scheduling_priority resource take precedence."
+                "(schedulingPriorityOverride, 0-9999). Only meaningful on "
+                "fair-share job queues, i.e. queues with a scheduling policy "
+                "attached; ignored otherwise. Per-rule overrides via the "
+                "aws_batch_scheduling_priority resource take precedence. A group "
+                "job gets the highest of its members' priorities."
             ),
             "env_var": False,
             "required": False,
@@ -136,7 +146,26 @@ class ExecutorSettings(ExecutorSettingsBase):
                 "before. Unset, the plugin sends no retryStrategy (a pre-existing job "
                 "definition's own, if any, applies) and a host termination fails the "
                 "job like any other failure. Per-rule overrides via the "
-                "aws_batch_spot_attempts resource take precedence."
+                "aws_batch_spot_attempts resource take precedence. A group job gets "
+                "the smallest of its members' values."
+            ),
+            "env_var": False,
+            "required": False,
+        },
+    )
+    log_group: Optional[str] = field(
+        default=None,
+        metadata={
+            "help": (
+                "Name (not ARN) of the CloudWatch Logs group that jobs log to (the "
+                "awslogs-group of each job definition the plugin registers). Unset, "
+                "jobs log to the AWS Batch default group, /aws/batch/job. The group "
+                "must already exist, "
+                "and the compute environment's instance role needs "
+                "logs:CreateLogStream and logs:PutLogEvents on it. Cannot be "
+                "combined with a pre-existing job definition "
+                "(--aws-batch-job-definition or the per-rule "
+                "aws_batch_job_definition resource)."
             ),
             "env_var": False,
             "required": False,
@@ -149,11 +178,12 @@ class ExecutorSettings(ExecutorSettingsBase):
                 "Use a pre-existing AWS Batch job definition instead of registering "
                 "one per job. Accepts a definition name (e.g. my-def), a name:revision "
                 "pair (my-def:3), or a full ARN. When set, resource configuration "
-                "(container image, job role, shared memory) is managed externally — "
-                "the container_image setting is ignored. Per-job specifics (command, "
-                "environment variables, vcpu/mem/gpu) are passed via "
-                "containerOverrides. Cannot be combined with --aws-batch-job-role "
-                "or the per-rule shared_memory_size_mb resource."
+                "(container image, job role, shared memory, log configuration) is "
+                "managed externally — the container_image setting is ignored. "
+                "Per-job specifics (command, environment variables, vcpu/mem/gpu) "
+                "are passed via containerOverrides. Cannot be combined with "
+                "--aws-batch-job-role, --aws-batch-log-group, or the per-rule "
+                "shared_memory_size_mb resource."
             ),
             "env_var": False,
             "required": False,
@@ -161,8 +191,16 @@ class ExecutorSettings(ExecutorSettingsBase):
     )
 
     def __post_init__(self):
-        # Fail at startup, not at the first submit, on an invalid value (a
-        # per-rule aws_batch_spot_attempts resource is checked at submit).
+        # Fail at startup, not at the first submit, on an invalid value (the
+        # per-rule aws_batch_* resources are checked at submit).
+        if self.task_timeout is not None:
+            self.task_timeout = validate_task_timeout(
+                self.task_timeout, "--aws-batch-task-timeout setting"
+            )
+        if self.scheduling_priority is not None:
+            self.scheduling_priority = validate_scheduling_priority(
+                self.scheduling_priority, "--aws-batch-scheduling-priority setting"
+            )
         if self.spot_attempts is not None:
             self.spot_attempts = validate_spot_attempts(
                 self.spot_attempts, "--aws-batch-spot-attempts setting"
@@ -396,18 +434,20 @@ class Executor(RemoteExecutor):
             self.cleanup_job_resources(j)
 
     def _preflight_validate(self) -> None:
-        """Fail fast on a definitively misconfigured queue / compute env / role.
+        """Fail fast on a definitively misconfigured queue / compute env / role /
+        log group.
 
         Best-effort about *uncertainty*: a transient API error or a missing
-        describe/iam permission degrades to a warning and the workflow proceeds.
-        Only a confirmed-bad configuration raises, before any job is submitted:
-        combining a global ``--aws-batch-job-role`` with a global
+        describe/iam/logs permission degrades to a warning and the workflow
+        proceeds. Only a confirmed-bad configuration raises, before any job is
+        submitted: combining a global ``--aws-batch-job-role`` with a global
         ``--aws-batch-job-definition``, a disabled/invalid queue or compute
-        environment, ``maxvCpus=0``, or a non-existent job role. The "a job role
-        is required in the default (register-per-job) mode" rule is enforced
-        per-job in ``BatchJobBuilder.build_job_definition`` instead, because
-        whether a given job uses a pre-existing definition can depend on a
-        per-rule ``aws_batch_job_definition`` resource not visible here.
+        environment, ``maxvCpus=0``, a non-existent job role, or a non-existent
+        log group. The "a job role is required in the default (register-per-job)
+        mode" rule is enforced per-job in ``BatchJobBuilder.build_job_definition``
+        instead, because whether a given job uses a pre-existing definition can
+        depend on a per-rule ``aws_batch_job_definition`` resource not visible
+        here.
         """
         job_definition = getattr(self.settings, "job_definition", None)
         job_role = getattr(self.settings, "job_role", None)
@@ -435,6 +475,7 @@ class Executor(RemoteExecutor):
                 "compute environment(s)."
             )
         self._validate_job_role()
+        self._validate_log_group()
         self._preflight_check_tags()
 
     def _preflight_check_tags(self) -> None:
@@ -666,3 +707,42 @@ class Executor(RemoteExecutor):
             )
         except Exception as e:
             self.logger.warning(f"skipping AWS Batch job-role preflight check: {e}")
+
+    def _validate_log_group(self) -> None:
+        """Verify the configured log group is a valid name and exists (the latter
+        best-effort; needs logs:DescribeLogGroups).
+
+        The awslogs driver does not create the group, so with a missing or
+        malformed one every job fails when its container starts. A malformed name
+        (e.g. an ARN) or a confirmed-missing group fails fast; any error from the
+        lookup (most importantly a missing ``logs:DescribeLogGroups`` permission)
+        degrades to a warning so the check never blocks a workflow on uncertainty.
+        """
+        log_group = getattr(self.settings, "log_group", None)
+        if not log_group:
+            return
+        if not LOG_GROUP_NAME.fullmatch(log_group):
+            raise WorkflowError(
+                f"Invalid CloudWatch Logs group name: {log_group!r} "
+                "(--aws-batch-log-group takes a log group name, not an ARN: 1-512 "
+                "characters from a-z, A-Z, 0-9, '.', '-', '_', '/' and '#')"
+            )
+        try:
+            # Results are ASCII-sorted by name, so an existing group is the first
+            # of those its name prefixes.
+            groups = (
+                boto3.client("logs", region_name=self.settings.region)
+                .describe_log_groups(logGroupNamePrefix=log_group, limit=1)
+                .get("logGroups", [])
+            )
+        except Exception as e:
+            self.logger.warning(
+                "skipping CloudWatch Logs group preflight check "
+                f"(could not describe log groups): {e}"
+            )
+            return
+        if not groups or groups[0].get("logGroupName") != log_group:
+            raise WorkflowError(
+                f"Configured CloudWatch Logs group does not exist: {log_group} "
+                "(--aws-batch-log-group; the plugin does not create it)"
+            )
