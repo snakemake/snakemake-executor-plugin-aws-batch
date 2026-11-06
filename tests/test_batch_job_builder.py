@@ -1307,6 +1307,9 @@ def _run_job(
     executor.format_job_exec = MagicMock(return_value="snakemake ...")
     executor.report_job_submission = MagicMock()
     executor.report_job_error = MagicMock()
+    # run_job validates the effective queue before submitting; that behavior is
+    # covered in tests/test_preflight.py, so stub it out here.
+    executor._validate_queue = MagicMock()
 
     job = MagicMock()
     job.name = "rule_a"
@@ -1320,6 +1323,7 @@ def _run_job(
             "jobQueue": "test-queue",
         }
         instance.job_queue = "test-queue"
+        instance.uses_preexisting_job_definition = False
         executor.run_job(job)
     return executor, mock_cls
 
