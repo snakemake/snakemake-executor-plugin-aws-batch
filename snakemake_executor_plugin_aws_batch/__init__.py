@@ -16,10 +16,20 @@ from snakemake_executor_plugin_aws_batch.batch_client import BatchClient
 from snakemake_executor_plugin_aws_batch.batch_job_builder import (
     BatchJobBuilder,
     build_job_tags,
+    shared_memory_size_mb,
     validate_spot_attempts,
 )
-from snakemake_executor_plugin_aws_batch.constant import FATAL_BATCH_STATUSES
+from snakemake_executor_plugin_aws_batch.constant import (
+    BATCH_JOB_PLATFORM_CAPABILITIES,
+    FATAL_BATCH_STATUSES,
+)
 from snakemake_executor_plugin_aws_batch.image_map import ImageMap
+from snakemake_executor_plugin_aws_batch.job_definition_map import (
+    JobDefinitionMap,
+    arn_region,
+    describe_job_definition,
+    job_definition_name,
+)
 from snakemake_interface_executor_plugins.executors.base import SubmittedJobInfo
 from snakemake_interface_executor_plugins.executors.remote import RemoteExecutor
 from snakemake_interface_executor_plugins.settings import (
@@ -78,8 +88,9 @@ class ExecutorSettings(ExecutorSettingsBase):
                 "The AWS job role ARN used to run the tasks. Required in the "
                 "default mode (it is baked into each per-job definition the "
                 "plugin registers), but optional when --aws-batch-job-definition "
-                "is set: a pre-existing job definition carries its own role, and "
-                "combining the two is rejected."
+                "or --aws-batch-job-definition-map is set: a pre-existing job "
+                "definition carries its own role, and combining the two is "
+                "rejected."
             ),
             "env_var": True,
             # Not `required: True`: a pre-existing job definition
@@ -158,8 +169,8 @@ class ExecutorSettings(ExecutorSettingsBase):
                 "and the compute environment's instance role needs "
                 "logs:CreateLogStream and logs:PutLogEvents on it. Cannot be "
                 "combined with a pre-existing job definition "
-                "(--aws-batch-job-definition or the per-rule "
-                "aws_batch_job_definition resource)."
+                "(--aws-batch-job-definition, --aws-batch-job-definition-map, or "
+                "the per-rule aws_batch_job_definition resource)."
             ),
             "env_var": False,
             "required": False,
@@ -176,7 +187,8 @@ class ExecutorSettings(ExecutorSettingsBase):
                 "managed externally — the container_image setting is ignored. "
                 "Per-job specifics (command, environment variables, vcpu/mem/gpu) "
                 "are passed via containerOverrides. Cannot be combined with "
-                "--aws-batch-job-role, --aws-batch-log-group, or the per-rule "
+                "--aws-batch-job-role, --aws-batch-log-group, "
+                "--aws-batch-job-definition-map, or the per-rule "
                 "shared_memory_size_mb resource."
             ),
             "env_var": False,
@@ -194,7 +206,40 @@ class ExecutorSettings(ExecutorSettingsBase):
                 "or normalized (ubuntu = docker.io/library/ubuntu:latest), and a job "
                 "whose image is not in the map fails without being submitted. "
                 "Cannot be combined with --aws-batch-job-definition or the per-rule "
-                "aws_batch_job_definition resource."
+                "aws_batch_job_definition resource; with "
+                "--aws-batch-job-definition-map, the mapped image is the one looked "
+                "up in that map. Takes only a file path, not inline JSON (in a "
+                "Snakemake profile too)."
+            ),
+            "env_var": True,
+            "required": False,
+        },
+    )
+    job_definition_map: Optional[str] = field(
+        default=None,
+        metadata={
+            "help": (
+                "A JSON object, inline or the path of a file holding it, mapping "
+                "container image references to pre-registered AWS Batch job "
+                "definitions (name, name:revision, or a job definition ARN with a "
+                "revision). When set, every job's "
+                "image (--container-image or a rule's aws_batch_container_image "
+                "resource, after --aws-batch-container-image-map when that is set) "
+                "is looked up in it, as written or normalized, and the job is "
+                "submitted against the definition it names, with the command, "
+                "environment and vcpu/mem/gpu in containerOverrides; the plugin "
+                "never registers or deregisters a job definition. A job whose image "
+                "is not in the map fails without being submitted. A rule's "
+                "shared_memory_size_mb may not exceed an EC2 definition's "
+                "sharedMemorySize; on a Fargate definition, which cannot set "
+                "/dev/shm, it is ignored with a warning. Inline JSON is for this "
+                "option and the environment variable; in a Snakemake profile, give "
+                "a file path: Snakemake drops an unquoted mapping, and on Python "
+                "before 3.14 a quoted inline value can make it fail to load the "
+                "profile (ENAMETOOLONG). Cannot be combined with "
+                "--aws-batch-job-definition, --aws-batch-job-role, "
+                "--aws-batch-log-group, or the per-rule aws_batch_job_definition "
+                "resource."
             ),
             "env_var": True,
             "required": False,
@@ -248,6 +293,8 @@ common_settings = CommonSettings(
 class Executor(RemoteExecutor):
     # Set from the container_image_map setting in __post_init__; None = no map.
     image_map: Optional[ImageMap] = None
+    # Set from the job_definition_map setting in __post_init__; None = no map.
+    job_definition_map: Optional[JobDefinitionMap] = None
 
     def __post_init__(self):
         # snakemake/snakemake:latest container image
@@ -278,6 +325,14 @@ class Executor(RemoteExecutor):
                 f"({len(self.image_map)} entries)"
             )
 
+        self._load_job_definition_map()
+        # Each job definition from the job definition map that a job has asked
+        # shared memory of, as described, keyed by the definition as the map names
+        # it. Successful descriptions are cached unless a rejected submission
+        # evicts a bare-name entry; failed descriptions are not cached, so the next
+        # job retries them. See _describe_mapped_job_definition.
+        self._mapped_job_definition_cache: Dict[str, dict] = {}
+
         try:
             self.batch_client = BatchClient(region_name=self.settings.region)
         except Exception as e:
@@ -307,8 +362,18 @@ class Executor(RemoteExecutor):
         # If required, make sure to pass the job's id to the job_info object, as keyword
         # argument 'external_job_id'.
 
+        # With a job definition map, an invalid shared_memory_size_mb stops the run,
+        # as it does when the builder validates it on the dynamic path.
+        shm_size = (
+            shared_memory_size_mb(job.resources)
+            if self.job_definition_map is not None
+            else None
+        )
         try:
             container_image = self._container_image(job)
+            mapped_job_definition = self._mapped_job_definition(
+                job, container_image, shm_size
+            )
         except WorkflowError as e:
             # Fail this job like any other failed job: jobs already running finish,
             # and --keep-going and restarts apply.
@@ -323,6 +388,10 @@ class Executor(RemoteExecutor):
                 settings=self.settings,
                 job_command=self.format_job_exec(job),
                 batch_client=self.batch_client,
+                mapped_job_definition=mapped_job_definition,
+                # _mapped_job_definition has checked the job's shared_memory_size_mb
+                # against the definition it returned.
+                shared_memory_checked=mapped_job_definition is not None,
             )
             # Validate the queue this job actually targets — which may be a
             # per-rule ``batch_queue`` override, not the global one — before
@@ -342,10 +411,21 @@ class Executor(RemoteExecutor):
                 "job_queue": job_definition.job_queue,
             }
             self.logger.debug(f"AWS Batch job submitted: {log_info}")
-        except WorkflowError:
-            # A queue-validation failure is already a clear, actionable message —
-            # let it surface as-is rather than re-wrapping it as a submit failure
-            # (the job was never submitted).
+        except WorkflowError as e:
+            if (
+                self.job_definition_map is not None
+                and shm_size is not None
+                and isinstance(e.__cause__, ClientError)
+                and e.__cause__.operation_name == "SubmitJob"
+            ):
+                mapped = self.job_definition_map.require(container_image, job.name)
+                if job_definition_name(mapped) is not None:
+                    # AWS rejected the submission; a later job may find a newer
+                    # ACTIVE revision instead of reusing the cached snapshot.
+                    self._mapped_job_definition_cache.pop(mapped, None)
+                    self.report_job_error(SubmittedJobInfo(job=job), msg=str(e))
+                    return
+            # Keep actionable queue-validation and builder errors as-is.
             raise
         except Exception as e:
             raise WorkflowError(f"Failed to submit AWS Batch job: {e}") from e
@@ -372,6 +452,192 @@ class Executor(RemoteExecutor):
                 "cannot check"
             )
         return self.image_map.require(image, job.name)
+
+    def _load_job_definition_map(self) -> None:
+        """Load the job definition map setting, refusing the settings it excludes.
+
+        The map chooses every job's definition by the job's image, so a global
+        pre-existing definition would be ambiguous, and the job role and log group
+        are baked into the pre-registered definitions, where the plugin cannot set
+        them. Raises ``WorkflowError`` for those combinations and for a map that
+        cannot be read.
+        """
+        value = self.settings.job_definition_map
+        if not value:
+            return
+        # The options the map excludes, each with its environment variable when it
+        # has one, and the setting it is read into.
+        conflicts = [
+            option
+            for option, name in (
+                ("--aws-batch-job-definition", "job_definition"),
+                ("--aws-batch-job-role (or SNAKEMAKE_AWS_BATCH_JOB_ROLE)", "job_role"),
+                ("--aws-batch-log-group", "log_group"),
+            )
+            if getattr(self.settings, name)
+        ]
+        if conflicts:
+            raise WorkflowError(
+                "Cannot combine the job definition map "
+                "(--aws-batch-job-definition-map or "
+                f"SNAKEMAKE_AWS_BATCH_JOB_DEFINITION_MAP) with {', '.join(conflicts)}: "
+                "every job runs on the pre-registered definition the map names for "
+                "its image, which carries its own job role and log configuration; "
+                "remove the option or unset the environment variable"
+            )
+        inline = JobDefinitionMap.is_inline(value)
+        try:
+            self.job_definition_map = JobDefinitionMap.from_setting(value)
+        except (OSError, ValueError) as e:
+            source = "given inline" if inline else value
+            hint = ""
+            if isinstance(e, FileNotFoundError):
+                hint = (
+                    " (a value that does not start with '{' is read as the path of "
+                    "a file)"
+                )
+            raise WorkflowError(
+                f"Failed to read the job definition map ({source}): {e}{hint}"
+            ) from e
+        source = "the inline job definition map" if inline else value
+        self.logger.info(
+            f"Jobs run on the pre-registered job definitions in {source} "
+            f"({len(self.job_definition_map)} entries)"
+        )
+
+    def _mapped_job_definition(
+        self,
+        job: JobExecutorInterface,
+        container_image: str,
+        shm_size: Optional[int],
+    ) -> Optional[str]:
+        """The job definition the job definition map names for ``container_image``,
+        or ``None`` without a map.
+
+        ``shm_size`` is the job's validated ``shared_memory_size_mb`` (see
+        :func:`shared_memory_size_mb`), checked here against the definition.
+        Raises ``WorkflowError`` (the job fails without being submitted) when the
+        image is not in the map, when the rule names its own definition with the
+        ``aws_batch_job_definition`` resource (the map, not the workflow, chooses the
+        definition), or, when ``shm_size`` is set, when the definition is not ACTIVE,
+        is not a container definition, or is for EC2 and sets less shared memory.
+        On a Fargate definition, which cannot set ``/dev/shm``, ``shm_size`` is
+        ignored with a warning.
+
+        A bare name that was described is returned as ``name:revision`` of the
+        revision checked, so ``SubmitJob`` runs the job on exactly that revision rather
+        than on whichever is latest when it is submitted.
+        """
+        if self.job_definition_map is None:
+            return None
+        rule_job_definition = job.resources.get("aws_batch_job_definition")
+        if rule_job_definition:
+            raise WorkflowError(
+                f"{job.name}: cannot run on the job definition "
+                f"{rule_job_definition!r} (aws_batch_job_definition) with a job "
+                "definition map: the map chooses each job's definition by its image; "
+                "remove the aws_batch_job_definition resource from the rule"
+            )
+        job_definition = self.job_definition_map.require(container_image, job.name)
+        if shm_size is None:
+            return job_definition
+        described = self._describe_mapped_job_definition(job_definition, job.name)
+        # The revision checked, which a bare name would not pin at submission.
+        name = job_definition_name(job_definition)
+        submitted = (
+            job_definition if name is None else f"{name}:{described['revision']}"
+        )
+        where = (
+            f"job definition {job_definition!r}, which the job definition map names "
+            f"for {container_image!r}"
+        )
+        container_properties = described.get("containerProperties")
+        if container_properties is None:
+            raise WorkflowError(
+                f"{job.name}: shared_memory_size_mb={shm_size} cannot be checked "
+                f"against {where}: it has no containerProperties (it uses ECS, "
+                "multi-node or EKS properties), so the shared memory check does not "
+                "apply to it; drop the resource or map the image to a container "
+                "job definition"
+            )
+        platforms = described.get("platformCapabilities") or []
+        if BATCH_JOB_PLATFORM_CAPABILITIES.FARGATE.value in platforms:
+            self.logger.warning(
+                f"{job.name}: shared_memory_size_mb={shm_size} is ignored on the "
+                f"Fargate {where}: Fargate cannot set /dev/shm "
+                "(linuxParameters.sharedMemorySize)"
+            )
+            return submitted
+        linux_parameters = container_properties.get("linuxParameters") or {}
+        limit = linux_parameters.get("sharedMemorySize")
+        if not limit:
+            raise WorkflowError(
+                f"{job.name}: shared_memory_size_mb={shm_size} cannot be met: "
+                f"{where}, sets no shared memory size (linuxParameters."
+                "sharedMemorySize); drop the resource or register the definition "
+                "with one"
+            )
+        if shm_size > int(limit):
+            raise WorkflowError(
+                f"{job.name}: shared_memory_size_mb={shm_size} exceeds the "
+                f"{limit} MiB of shared memory (linuxParameters.sharedMemorySize) "
+                f"of {where}; lower the resource or register the definition with "
+                "more"
+            )
+        return submitted
+
+    def _describe_mapped_job_definition(
+        self, job_definition: str, job_name: str
+    ) -> dict:
+        """``job_definition`` as ``DescribeJobDefinitions`` returns it (for a bare
+        name, its highest ACTIVE revision, as ``SubmitJob`` resolves it).
+
+        Cached for the run after a successful describe, so a bare name is a
+        snapshot of its latest ACTIVE revision when a job first asked for shared
+        memory on it, and those jobs are submitted to that revision (see
+        :meth:`_mapped_job_definition`); a revision registered later in the run is
+        not seen unless AWS rejects a submission on that cached revision, which
+        evicts the bare-name entry so the next job describes it again. Raises
+        ``WorkflowError`` when the definition cannot be described (e.g. a missing
+        ``batch:DescribeJobDefinitions`` permission), does not exist, or is not
+        ACTIVE; a failure is not cached, so the next job tries again.
+        """
+        cached = self._mapped_job_definition_cache.get(job_definition)
+        if cached is not None:
+            return cached
+        try:
+            described = describe_job_definition(self.batch_client, job_definition)
+        except Exception as e:
+            raise WorkflowError(
+                f"{job_name}: cannot check shared_memory_size_mb against job "
+                f"definition {job_definition!r}: describing it failed (this check "
+                f"needs batch:DescribeJobDefinitions): {e}"
+            ) from e
+        if described is None:
+            region = self.batch_client.region_name
+            definition_region = arn_region(job_definition)
+            if definition_region:
+                region_hint = (
+                    f" in submission region {region} (ARN region {definition_region}); "
+                    "use a definition in the submission region"
+                )
+            else:
+                region_hint = f" in region {region}" if region else ""
+            raise WorkflowError(
+                f"{job_name}: job definition {job_definition!r}, which the job "
+                "definition map names for this job's image, was not found; check "
+                f"the map entry and that the definition is ACTIVE{region_hint}"
+            )
+        status = described.get("status")
+        if status != "ACTIVE":
+            raise WorkflowError(
+                f"{job_name}: job definition {job_definition!r}, which the job "
+                f"definition map names for this job's image, is {status} (not "
+                "ACTIVE), so jobs cannot be submitted to it; map the image to an "
+                "ACTIVE revision"
+            )
+        self._mapped_job_definition_cache[job_definition] = described
+        return described
 
     async def check_active_jobs(
         self, active_jobs: List[SubmittedJobInfo]

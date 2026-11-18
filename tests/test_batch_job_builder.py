@@ -5,6 +5,7 @@ validation, and Fargate rejection in build_job_definition. All tests run with
 mocked AWS clients — no AWS credentials required.
 """
 
+import json
 import os
 import re
 from types import SimpleNamespace
@@ -1413,6 +1414,8 @@ def _make_builder_with_preexisting(
     job_role: str | None = None,
     envvars: dict | None = None,
     threads: int = 2,
+    mapped_job_definition: str | None = None,
+    shared_memory_checked: bool = False,
 ) -> BatchJobBuilder:
     """Return a BatchJobBuilder configured with a pre-existing job definition."""
     if resources is None:
@@ -1438,7 +1441,74 @@ def _make_builder_with_preexisting(
         settings=settings,
         job_command="snakemake --jobs 1",
         batch_client=batch_client,
+        mapped_job_definition=mapped_job_definition,
+        shared_memory_checked=shared_memory_checked,
     )
+
+
+class TestMappedJobDefinition:
+    """A definition the executor chose from the job definition map."""
+
+    def test_the_mapped_definition_wins(self):
+        builder = _make_builder_with_preexisting(
+            job_definition="global:1",
+            resources={
+                "_cores": 2,
+                "mem_mb": 2048,
+                "aws_batch_job_definition": "rule:1",
+            },
+            mapped_job_definition="mapped:1",
+        )
+        assert builder._resolve_preexisting_job_definition() == "mapped:1"
+        assert builder.uses_preexisting_job_definition is True
+
+    @pytest.mark.parametrize("checked", [True, False])
+    def test_shared_memory_is_accepted_only_when_checked(self, checked):
+        builder = _make_builder_with_preexisting(
+            job_definition=None,
+            resources={"_cores": 2, "mem_mb": 2048, "shared_memory_size_mb": 1024},
+            mapped_job_definition="mapped:1",
+            shared_memory_checked=checked,
+        )
+        if checked:
+            builder._validate_preexisting_compatibility()
+        else:
+            with pytest.raises(WorkflowError, match="shared_memory_size_mb"):
+                builder._validate_preexisting_compatibility()
+
+
+class TestPreExistingOverridesSize:
+    """A SubmitJob refusal of the overrides reports a compact-JSON size estimate."""
+
+    def test_an_overrides_error_names_the_estimated_size(self) -> None:
+        builder = _make_builder_with_preexisting(envvars={"A": "x" * 100})
+        builder.batch_client.submit_job.side_effect = Exception(
+            "Container Overrides length must be at most 8192"
+        )
+        with pytest.raises(WorkflowError) as err:
+            builder.submit()
+        overrides = builder.batch_client.submit_job.call_args.kwargs[
+            "containerOverrides"
+        ]
+        size = len(json.dumps(overrides, separators=(",", ":")))
+        assert str(err.value) == (
+            "Failed to submit job: Container Overrides length must be at most 8192 "
+            f"(the containerOverrides size estimate is {size} characters of compact "
+            "JSON, holding the job's command and environment variables; the "
+            "transmitted JSON can be larger; run smaller groups or pass fewer "
+            "environment variables)"
+        )
+
+    @pytest.mark.parametrize(
+        "message",
+        ["AccessDenied", "Can't override job definition resource requirements"],
+    )
+    def test_another_error_has_no_size_hint(self, message):
+        builder = _make_builder_with_preexisting()
+        builder.batch_client.submit_job.side_effect = Exception(message)
+        with pytest.raises(WorkflowError) as err:
+            builder.submit()
+        assert str(err.value) == f"Failed to submit job: {message}"
 
 
 class TestPreExistingJobDefinition:

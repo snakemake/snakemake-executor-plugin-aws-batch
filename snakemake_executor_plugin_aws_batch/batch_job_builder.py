@@ -1,3 +1,4 @@
+import json
 import os
 import re
 import uuid
@@ -51,6 +52,56 @@ def validate_spot_attempts(attempts: Any, source: str) -> int:
             "must be in range [1, 10] (the AWS Batch limit)."
         )
     return attempts_int
+
+
+def shared_memory_size_mb(resources: Any) -> Optional[int]:
+    """The job's ``shared_memory_size_mb`` resource in MiB, or ``None`` when unset.
+
+    A falsy value (unset, the int 0, or an empty string) is ``None``. Any other
+    value is converted with ``int()`` (a string of digits is accepted, as Snakemake
+    resources may arrive as strings) and must then be positive: the string ``'0'``
+    raises ``WorkflowError``, as does a value ``int()`` rejects.
+    """
+    value = resources.get("shared_memory_size_mb")
+    if not value:
+        return None
+    try:
+        size = int(value)
+    except (TypeError, ValueError) as e:
+        raise WorkflowError(
+            f"Invalid shared_memory_size_mb resource {value!r}: "
+            f"must be an integer number of MiB."
+        ) from e
+    if size <= 0:
+        raise WorkflowError(
+            f"Invalid shared_memory_size_mb resource {size}: "
+            f"must be a positive number of MiB."
+        )
+    return size
+
+
+def _overrides_size_hint(error: Exception, container_overrides: dict) -> str:
+    """A hint for a ``SubmitJob`` error that may be about the size of
+    ``container_overrides``, or ``""`` when ``error`` does not mention the length or
+    size of the overrides.
+
+    A pre-existing job definition receives each job's command and environment in
+    ``containerOverrides``, and AWS caps the size of a job's overrides (ECS counts
+    the JSON, formatting included). The cap is not documented for AWS Batch, so the
+    plugin does not check it before submitting. The hint estimates the size as
+    compact JSON; the transmitted JSON can be larger due to formatting.
+    """
+    message = str(error).lower()
+    if "override" not in message or not any(
+        word in message for word in ("length", "size", "at most")
+    ):
+        return ""
+    size = len(json.dumps(container_overrides, separators=(",", ":")))
+    return (
+        f" (the containerOverrides size estimate is {size} characters of compact "
+        "JSON, holding the job's command and environment variables; the transmitted "
+        "JSON can be larger; run smaller groups or pass fewer environment variables)"
+    )
 
 
 def build_job_tags(settings) -> dict:
@@ -167,7 +218,22 @@ class BatchJobBuilder:
         settings,
         job_command: str,
         batch_client: BatchClient,
+        mapped_job_definition: Optional[str] = None,
+        shared_memory_checked: bool = False,
     ):
+        """
+        :param mapped_job_definition: the pre-registered job definition the
+            executor chose for this job from the job definition map, or ``None``
+            outside that mode. The executor refuses the per-rule
+            ``aws_batch_job_definition`` resource and the ``job_definition``
+            setting alongside the map; should either reach here anyway, the
+            mapped definition is used.
+        :param shared_memory_checked: whether the caller has checked the job's
+            ``shared_memory_size_mb`` resource against ``mapped_job_definition``
+            (accepted, or ignored with a warning on a Fargate definition). When
+            ``True`` the resource is accepted on that definition; otherwise a
+            pre-existing definition refuses it.
+        """
         self.logger = logger
         self.job = job
         self.envvars = envvars
@@ -175,6 +241,8 @@ class BatchJobBuilder:
         self.settings = settings
         self.job_command = job_command
         self.batch_client = batch_client
+        self.mapped_job_definition = mapped_job_definition
+        self.shared_memory_checked = shared_memory_checked
         self.created_job_defs = []
         # Per-rule queue override via `resources.batch_queue` — lets a multi-arch
         # workflow route each job to a queue wired to matching compute environment
@@ -374,8 +442,9 @@ class BatchJobBuilder:
         # The default (register-per-job) path bakes the job role into each
         # definition, so a role is mandatory here. It is only optional when a
         # pre-existing job definition is used — the global
-        # --aws-batch-job-definition or the per-rule aws_batch_job_definition
-        # resource — which carries its own role and is dispatched via
+        # --aws-batch-job-definition, the per-rule aws_batch_job_definition
+        # resource, or a definition from --aws-batch-job-definition-map — which
+        # carries its own role and is dispatched via
         # _submit_with_preexisting_definition before ever reaching this method.
         # Enforcing this per-job (rather than at global preflight) lets a
         # per-rule-definition-only workflow run without a global job role.
@@ -385,9 +454,9 @@ class BatchJobBuilder:
                 "mode: pass --aws-batch-job-role (or set "
                 "SNAKEMAKE_AWS_BATCH_JOB_ROLE) so it can be baked into each "
                 "registered job definition. It is only optional when you use a "
-                "pre-existing job definition (--aws-batch-job-definition or the "
-                "per-rule aws_batch_job_definition resource), which carries its "
-                "own role."
+                "pre-existing job definition (--aws-batch-job-definition, the "
+                "per-rule aws_batch_job_definition resource, or "
+                "--aws-batch-job-definition-map), which carries its own role."
             )
 
         job_name, job_definition_name = self._build_job_names()
@@ -442,20 +511,11 @@ class BatchJobBuilder:
         # in-memory indexes (e.g. bwa-mem2 shm). Rules opt in via
         # `resources.shared_memory_size_mb`. Only applies on EC2 — Fargate
         # does not honor linuxParameters.sharedMemorySize.
-        shm_size_mb = self.job.resources.get("shared_memory_size_mb")
-        if shm_size_mb and self.platform == BATCH_JOB_PLATFORM_CAPABILITIES.EC2.value:
-            try:
-                shm_size = int(shm_size_mb)
-            except (TypeError, ValueError) as e:
-                raise WorkflowError(
-                    f"Invalid shared_memory_size_mb resource {shm_size_mb!r}: "
-                    f"must be an integer number of MiB."
-                ) from e
-            if shm_size <= 0:
-                raise WorkflowError(
-                    f"Invalid shared_memory_size_mb resource {shm_size}: "
-                    f"must be a positive number of MiB."
-                )
+        shm_size = shared_memory_size_mb(self.job.resources)
+        if (
+            shm_size is not None
+            and self.platform == BATCH_JOB_PLATFORM_CAPABILITIES.EC2.value
+        ):
             container_properties["linuxParameters"] = {
                 "sharedMemorySize": shm_size,
             }
@@ -634,7 +694,8 @@ class BatchJobBuilder:
     def uses_preexisting_job_definition(self) -> bool:
         """Whether this job submits against a pre-existing job definition.
 
-        ``True`` when a per-rule ``aws_batch_job_definition`` resource or the
+        ``True`` when the executor chose a definition from the job definition
+        map, or a per-rule ``aws_batch_job_definition`` resource or the
         ``job_definition`` executor setting is in effect. Callers use this to
         preserve the smaller IAM surface of static definitions — the same reason
         the dynamic-only platform lookup is skipped for them (see ``platform``).
@@ -644,11 +705,16 @@ class BatchJobBuilder:
     def _resolve_preexisting_job_definition(self) -> Optional[str]:
         """Return the effective pre-existing job definition name/ARN, or None.
 
-        Checks the per-rule ``aws_batch_job_definition`` resource first (mirrors
-        the ``batch_queue`` override pattern), then falls back to the
-        ``job_definition`` executor setting.  Returns ``None`` when neither is
-        set, which triggers the dynamic registration path.
+        A definition from the job definition map when the executor chose one (the
+        executor refuses the per-rule ``aws_batch_job_definition`` resource and the
+        ``job_definition`` setting alongside the map, so they never combine with
+        it; the map's definition is returned first only as a safeguard).
+        Otherwise the per-rule resource (mirrors the ``batch_queue`` override
+        pattern), then the ``job_definition`` executor setting. Returns ``None``
+        when none is set, which triggers the dynamic registration path.
         """
+        if self.mapped_job_definition:
+            return self.mapped_job_definition
         per_rule = self.job.resources.get("aws_batch_job_definition")
         if per_rule:
             return str(per_rule)
@@ -662,7 +728,9 @@ class BatchJobBuilder:
         maps to ``linuxParameters.sharedMemorySize`` on the definition, not a
         container override, and ``log_group`` to its ``logConfiguration``.  All are
         silently useless in pre-existing mode, so we raise early rather than
-        silently ignore.
+        silently ignore.  The exception is ``shared_memory_size_mb`` when the
+        caller says it has checked the resource against the mapped definition
+        (``shared_memory_checked``).
 
         ``container_image`` cannot be distinguished from its default value so we
         document in the setting help text that it is ignored and do not raise here.
@@ -674,7 +742,10 @@ class BatchJobBuilder:
                 "using a pre-existing job definition.  Remove --aws-batch-job-role or "
                 "omit --aws-batch-job-definition."
             )
-        if self.job.resources.get("shared_memory_size_mb") is not None:
+        if (
+            not self.shared_memory_checked
+            and self.job.resources.get("shared_memory_size_mb") is not None
+        ):
             raise WorkflowError(
                 "Cannot combine the shared_memory_size_mb resource with "
                 "--aws-batch-job-definition: shared memory sizing is managed "
@@ -789,7 +860,10 @@ class BatchJobBuilder:
             submitted["_preexisting_job_definition"] = True
             return submitted
         except Exception as e:
-            raise WorkflowError(f"Failed to submit job: {e}") from e
+            raise WorkflowError(
+                f"Failed to submit job: {e}"
+                f"{_overrides_size_hint(e, container_overrides)}"
+            ) from e
 
     def submit(self):
         preexisting = self._resolve_preexisting_job_definition()
