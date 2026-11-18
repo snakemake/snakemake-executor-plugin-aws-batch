@@ -14,6 +14,7 @@ from botocore.exceptions import ClientError
 
 from snakemake_executor_plugin_aws_batch.batch_client import BatchClient
 from snakemake_executor_plugin_aws_batch.batch_job_builder import (
+    PRIVILEGED_WITH_JOB_DEFINITION_ERROR,
     BatchJobBuilder,
     build_job_tags,
     validate_spot_attempts,
@@ -23,6 +24,7 @@ from snakemake_executor_plugin_aws_batch.image_map import ImageMap
 from snakemake_interface_executor_plugins.executors.base import SubmittedJobInfo
 from snakemake_interface_executor_plugins.executors.remote import RemoteExecutor
 from snakemake_interface_executor_plugins.settings import (
+    DeploymentMethod,
     ExecutorSettingsBase,
     CommonSettings,
 )
@@ -176,8 +178,9 @@ class ExecutorSettings(ExecutorSettingsBase):
                 "managed externally — the container_image setting is ignored. "
                 "Per-job specifics (command, environment variables, vcpu/mem/gpu) "
                 "are passed via containerOverrides. Cannot be combined with "
-                "--aws-batch-job-role, --aws-batch-log-group, or the per-rule "
-                "shared_memory_size_mb resource."
+                "--aws-batch-job-role, --aws-batch-log-group, "
+                "--aws-batch-privileged, the per-rule shared_memory_size_mb "
+                "resource, or the per-rule aws_batch_privileged resource."
             ),
             "env_var": False,
             "required": False,
@@ -197,6 +200,27 @@ class ExecutorSettings(ExecutorSettingsBase):
                 "aws_batch_job_definition resource."
             ),
             "env_var": True,
+            "required": False,
+        },
+    )
+
+    privileged: bool = field(
+        default=False,
+        metadata={
+            "help": (
+                "Run job containers in privileged mode (sets privileged in each "
+                "job definition the plugin registers), which gives them root "
+                "access to the host's devices and kernel features. Off by default; "
+                "needed only by jobs that do something a container normally may "
+                "not, such as running Apptainer/Singularity inside the job "
+                "container (--software-deployment-method apptainer) or mounting a "
+                "FUSE file system. A rule can override it with the "
+                "aws_batch_privileged resource. Rejected at startup with "
+                "--aws-batch-job-definition; a rule that uses the per-rule "
+                "aws_batch_job_definition resource gets privileged from that "
+                "definition instead."
+            ),
+            "env_var": False,
             "required": False,
         },
     )
@@ -257,6 +281,7 @@ class Executor(RemoteExecutor):
 
         self.settings = self.workflow.executor_settings
         self.logger.debug(f"ExecutorSettings: {pformat(self.settings, indent=2)}")
+        self._warn_if_apptainer_needs_privileged()
 
         map_path = self.settings.container_image_map
         if map_path:
@@ -295,6 +320,28 @@ class Executor(RemoteExecutor):
         # see _validate_queue — so an unused (possibly unhealthy) global queue
         # never blocks a workflow that only submits to healthy per-rule queues.
         self._preflight_validate()
+
+    def _warn_if_apptainer_needs_privileged(self) -> None:
+        """Warn when jobs deploy software with Apptainer but registered job
+        definitions are not privileged: Apptainer inside the job's container
+        generally needs the privileges --aws-batch-privileged grants, which are
+        off by default. Skipped with --aws-batch-job-definition, whose
+        definition decides whether its container is privileged."""
+        if self.settings.privileged or self.settings.job_definition:
+            return
+        methods = self.workflow.deployment_settings.deployment_method
+        if DeploymentMethod.APPTAINER in methods:
+            self.logger.warning(
+                "Jobs deploy software with Apptainer, which generally needs a "
+                "privileged container, but the job definitions the executor "
+                "registers are not privileged. If jobs fail to start Apptainer, "
+                "pass --aws-batch-privileged or set the aws_batch_privileged "
+                "resource on the rules that need it. Setting that resource does "
+                "not silence this warning, since rule resources are not known at "
+                "startup. A rule that uses a pre-existing job definition (the "
+                "aws_batch_job_definition resource) must set privileged in that "
+                "definition itself."
+            )
 
     def run_job(self, job: JobExecutorInterface):
         # Implement here how to run a job.
@@ -508,12 +555,13 @@ class Executor(RemoteExecutor):
         Best-effort about *uncertainty*: a transient API error or a missing
         iam/logs permission degrades to a warning and the workflow proceeds.
         Only a confirmed-bad configuration raises here: combining a global
-        ``--aws-batch-job-role`` with a global ``--aws-batch-job-definition``, a
-        non-existent job role, or a non-existent log group. The "a job role is
-        required in the default (register-per-job) mode" rule is enforced
-        per-job in ``BatchJobBuilder.build_job_definition`` instead, because
-        whether a given job uses a pre-existing definition can depend on a
-        per-rule ``aws_batch_job_definition`` resource not visible here.
+        ``--aws-batch-job-role`` or ``--aws-batch-privileged`` with a global
+        ``--aws-batch-job-definition``, a non-existent job role, or a
+        non-existent log group. The "a job role is required in the default
+        (register-per-job) mode" rule is enforced per-job in
+        ``BatchJobBuilder.build_job_definition`` instead, because whether a
+        given job uses a pre-existing definition can depend on a per-rule
+        ``aws_batch_job_definition`` resource not visible here.
 
         Job-queue and compute-environment health is intentionally *not* checked
         here: which queue a job runs on can depend on a per-rule ``batch_queue``
@@ -537,6 +585,13 @@ class Executor(RemoteExecutor):
                 "when using a pre-existing job definition. Remove "
                 "--aws-batch-job-role or omit --aws-batch-job-definition."
             )
+        # Likewise for --aws-batch-privileged, which applies only to the job
+        # definitions the plugin registers: with a global pre-existing definition
+        # it could never apply. (A rule with its own aws_batch_job_definition
+        # resource just takes privileged from that definition; see
+        # BatchJobBuilder._validate_preexisting_compatibility.)
+        if job_definition and self.settings.privileged:
+            raise WorkflowError(PRIVILEGED_WITH_JOB_DEFINITION_ERROR)
         self._validate_job_role()
         self._validate_log_group()
         self._preflight_check_tags()

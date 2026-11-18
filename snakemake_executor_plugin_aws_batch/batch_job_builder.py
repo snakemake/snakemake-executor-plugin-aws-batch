@@ -28,6 +28,16 @@ HOST_TERMINATED_STATUS_REASON = "Host EC2*"
 TBD_RESOURCE_VALUE = "<TBD>"
 
 
+# Why --aws-batch-privileged cannot be used with the global
+# --aws-batch-job-definition. Preflight raises it at startup; the builder raises it
+# again for callers that build jobs without running preflight.
+PRIVILEGED_WITH_JOB_DEFINITION_ERROR = (
+    "Cannot combine --aws-batch-privileged with --aws-batch-job-definition: "
+    "whether the container is privileged is set in the pre-existing job "
+    "definition. Remove --aws-batch-privileged or omit --aws-batch-job-definition."
+)
+
+
 def _is_tbd(value: Any) -> bool:
     """Whether ``value`` is Snakemake's not-yet-evaluable resource placeholder."""
     return isinstance(value, str) and value == TBD_RESOURCE_VALUE
@@ -416,7 +426,10 @@ class BatchJobBuilder:
             "command": self._make_container_command(self.job_command),
             "environment": environment,
             "jobRoleArn": self.settings.job_role,
-            "privileged": True,
+            # Privileged containers get root access to the host's devices and
+            # kernel features, so they are opt-in (--aws-batch-privileged or the
+            # per-rule aws_batch_privileged resource).
+            "privileged": self._resolve_privileged(),
             "resourceRequirements": [
                 {
                     "type": BATCH_JOB_RESOURCE_REQUIREMENT_TYPE.VCPU.value,
@@ -534,6 +547,45 @@ class BatchJobBuilder:
                 f"got {task_timeout}."
             )
         return task_timeout
+
+    def _resolve_privileged(self) -> bool:
+        """Whether the job definition this job registers is privileged.
+
+        The per-rule ``aws_batch_privileged`` resource takes precedence over the
+        workflow-level ``privileged`` setting (``--aws-batch-privileged``). The
+        resource may be a boolean, ``0``/``1`` or ``"true"``/``"false"`` (any
+        case, surrounding whitespace ignored), since ``--set-resources`` passes
+        integers and strings. Raises ``WorkflowError`` for any other value.
+
+        A group job runs in one container, so it is privileged when any of its
+        member jobs is. Its own ``resources`` would not do: Snakemake sums a
+        group's integer resources across members that run in parallel. A member
+        whose resource Snakemake cannot evaluate yet (``<TBD>``) counts as not
+        setting it, so it falls back to the setting.
+        """
+        if isinstance(self.job, GroupJobExecutorInterface):
+            # A list, not a generator: every member's value is validated, even
+            # after one that is privileged.
+            return any([self._job_privileged(member) for member in self.job.jobs])
+        return self._job_privileged(self.job)
+
+    def _job_privileged(self, job: JobExecutorInterface) -> bool:
+        """One (non-group) job's privileged value; see ``_resolve_privileged``."""
+        rule_privileged = job.resources.get("aws_batch_privileged")
+        if rule_privileged is None or _is_tbd(rule_privileged):
+            return self.settings.privileged
+        if isinstance(rule_privileged, str):
+            normalized = rule_privileged.strip().lower()
+            if normalized in ("true", "1"):
+                return True
+            if normalized in ("false", "0"):
+                return False
+        elif isinstance(rule_privileged, int) and rule_privileged in (0, 1):
+            return bool(rule_privileged)  # bool is a subclass of int
+        raise WorkflowError(
+            f"Invalid aws_batch_privileged resource {rule_privileged!r} in rule "
+            f"{job.name}: must be true or false (or 1 or 0)."
+        )
 
     def _resolve_scheduling_priority(self) -> Optional[int]:
         """Resolve the effective scheduling priority override, or ``None``.
@@ -660,9 +712,18 @@ class BatchJobBuilder:
         ``job_role`` is baked into the job definition at registration time and
         cannot be overridden via ``containerOverrides``.  ``shared_memory_size_mb``
         maps to ``linuxParameters.sharedMemorySize`` on the definition, not a
-        container override, and ``log_group`` to its ``logConfiguration``.  All are
-        silently useless in pre-existing mode, so we raise early rather than
-        silently ignore.
+        container override, ``log_group`` to its ``logConfiguration``, and the
+        ``aws_batch_privileged`` resource to its ``privileged``.  All are silently
+        useless in pre-existing mode, so we raise early rather than silently
+        ignore.
+
+        ``--aws-batch-privileged`` applies only to the definitions the plugin
+        registers.  A rule with its own ``aws_batch_job_definition`` resource
+        takes ``privileged`` from that definition, which the setting does not
+        reach; with the global ``--aws-batch-job-definition`` the setting can
+        never apply and is refused (normally already at preflight).  The
+        ``aws_batch_privileged`` resource is refused if any member of a group
+        job sets it.
 
         ``container_image`` cannot be distinguished from its default value so we
         document in the setting help text that it is ignored and do not raise here.
@@ -681,6 +742,28 @@ class BatchJobBuilder:
                 "externally when using a pre-existing job definition.  Remove the "
                 "shared_memory_size_mb resource or omit --aws-batch-job-definition."
             )
+        # Per member: a group's own resources sum parallel members' integers.
+        members = (
+            self.job.jobs
+            if isinstance(self.job, GroupJobExecutorInterface)
+            else [self.job]
+        )
+        for member in members:
+            if member.resources.get("aws_batch_privileged") is not None:
+                raise WorkflowError(
+                    "Cannot combine the aws_batch_privileged resource of rule "
+                    f"{member.name} with a pre-existing job definition "
+                    "(--aws-batch-job-definition or the per-rule "
+                    "aws_batch_job_definition resource): whether the container is "
+                    "privileged is set in the pre-existing job definition.  Remove "
+                    "the aws_batch_privileged resource or the pre-existing job "
+                    "definition."
+                )
+        # The setting does not reach a rule's own (per-rule) definition, but can
+        # never apply with the global one.
+        per_rule_definition = self.job.resources.get("aws_batch_job_definition")
+        if self.settings.privileged and not per_rule_definition:
+            raise WorkflowError(PRIVILEGED_WITH_JOB_DEFINITION_ERROR)
         if getattr(self.settings, "log_group", None):
             raise WorkflowError(
                 "Cannot combine log_group (--aws-batch-log-group) with a pre-existing "

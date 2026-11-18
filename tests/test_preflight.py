@@ -10,12 +10,14 @@ describe/iam/logs permission).
 """
 
 import os
+import re
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import pytest
 from botocore.exceptions import ClientError
 from snakemake_interface_common.exceptions import WorkflowError
+from snakemake_interface_executor_plugins.settings import DeploymentMethod
 
 from snakemake_executor_plugin_aws_batch import (
     Executor,
@@ -23,8 +25,10 @@ from snakemake_executor_plugin_aws_batch import (
     _is_access_denied,
 )
 from snakemake_executor_plugin_aws_batch.batch_job_builder import (
+    PRIVILEGED_WITH_JOB_DEFINITION_ERROR,
     SNAKEMAKE_AWS_BATCH_JOB_TAGS_ENV_VAR,
 )
+from tests.helpers import post_init_executor
 
 
 def _env_without_tags() -> dict:
@@ -44,6 +48,7 @@ def _executor(**settings) -> Executor:
         "region": "us-east-1",
         "job_queue": "arn:q",
         "job_role": "arn:aws:iam::1:role/default",
+        "privileged": False,
     }
     base.update(settings)
     ex = Executor.__new__(Executor)
@@ -878,3 +883,68 @@ class TestValidateLogGroup:
         with patch("boto3.client") as mocked_client:
             ex._validate_log_group()
             mocked_client.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# --aws-batch-privileged with Apptainer
+# ---------------------------------------------------------------------------
+
+
+def test_the_privileged_setting_defaults_to_off():
+    assert ExecutorSettings().privileged is False
+
+
+@pytest.mark.parametrize(
+    "methods",
+    [
+        {DeploymentMethod.APPTAINER},
+        {DeploymentMethod.CONDA, DeploymentMethod.APPTAINER},
+    ],
+)
+def test_apptainer_without_privileged_warns(methods):
+    executor = post_init_executor(methods)
+    executor.logger.warning.assert_called_once()
+    message = executor.logger.warning.call_args.args[0]
+    assert "--aws-batch-privileged" in message
+    assert "aws_batch_privileged resource" in message
+    assert "pre-existing job definition" in message
+    assert "does not silence this warning" in message
+
+
+def test_apptainer_with_privileged_does_not_warn():
+    executor = post_init_executor({DeploymentMethod.APPTAINER}, privileged=True)
+    executor.logger.warning.assert_not_called()
+
+
+def test_no_apptainer_does_not_warn():
+    executor = post_init_executor({DeploymentMethod.CONDA})
+    executor.logger.warning.assert_not_called()
+
+
+def test_no_deployment_method_does_not_warn():
+    executor = post_init_executor(set())
+    executor.logger.warning.assert_not_called()
+
+
+def test_apptainer_with_a_global_job_definition_does_not_warn():
+    # The pre-existing definition decides whether its container is privileged.
+    executor = post_init_executor(
+        {DeploymentMethod.APPTAINER}, job_definition="my-def:3"
+    )
+    executor.logger.warning.assert_not_called()
+
+
+def test_privileged_with_a_global_job_definition_fails_preflight():
+    ex = _executor(job_role=None, job_definition="my-def:3", privileged=True)
+    with pytest.raises(
+        WorkflowError, match=f"^{re.escape(PRIVILEGED_WITH_JOB_DEFINITION_ERROR)}$"
+    ):
+        ex._preflight_validate()
+
+
+def test_privileged_without_a_job_definition_passes_preflight():
+    ex = _executor(job_definition=None, privileged=True)
+    with patch.object(Executor, "_validate_job_role"), patch.object(
+        Executor, "_validate_log_group"
+    ), patch.object(Executor, "_preflight_check_tags"):
+        ex._preflight_validate()
