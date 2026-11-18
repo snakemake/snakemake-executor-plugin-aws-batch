@@ -15,12 +15,14 @@ spelling.
 
 import json
 from pathlib import Path
-from typing import Any, Dict, List, Mapping, Optional, Tuple
+from typing import Any, Dict, List, Mapping, Optional, Tuple, Type, TypeVar
 
 from snakemake_interface_common.exceptions import WorkflowError
 
 DOCKER_HUB = "docker.io"
 DOCKER_HUB_ALIASES = ("index.docker.io", "registry-1.docker.io")
+
+_MapT = TypeVar("_MapT", bound="_ImageKeyedMap")
 
 
 def normalize(ref: str) -> str:
@@ -68,64 +70,104 @@ def _unique_keys(pairs: List[Tuple[str, Any]]) -> Dict[str, Any]:
     return obj
 
 
-class ImageMap:
-    """Image references to the images to run in their place."""
+class _ImageKeyedMap:
+    """Image references to values, each looked up as written or normalized.
+
+    The base of :class:`ImageMap` (image to image) and
+    :class:`~snakemake_executor_plugin_aws_batch.job_definition_map.JobDefinitionMap`
+    (image to job definition). Subclasses set the class attributes below, which name
+    the map in its errors, and :meth:`_check_entry`, which says what an entry may be.
+    """
+
+    # What the map is called in error messages, e.g. "job definition map".
+    KIND: str
+    # What an entry maps to, in the plural, e.g. "job definitions".
+    VALUES: str
+    # The error for a file that is not a JSON object.
+    NOT_AN_OBJECT: str
+    # The error for a job whose image is not in the map, formatted with the job's
+    # name (``job_name``), its image (``image``) and where the map was read from
+    # (``where``).
+    MISSING: str
 
     def __init__(self, mapping: Mapping[str, str], path: Optional[str] = None):
         # Where the map was read from, for error messages.
         self.path = path
         self._entries: Dict[str, str] = {}
-        for ref, image in mapping.items():
-            if not _is_reference(ref) or not _is_reference(image):
-                raise ValueError(
-                    f"image map entry {ref!r}: {image!r} is not a pair of references"
-                )
-            self._entries[ref] = image
+        for ref, value in mapping.items():
+            self._check_entry(ref, value)
+            self._entries[ref] = value
         # Each entry also answers to its normalized spelling, unless the map names that
         # spelling itself. Entries that share a normalized spelling must agree on the
-        # image, or which one a job gets would depend on the order of the map.
+        # value, or which one a job gets would depend on the order of the map.
         self._lookup: Dict[str, str] = dict(self._entries)
         named_by: Dict[str, str] = {}
-        for ref, image in self._entries.items():
+        for ref, value in self._entries.items():
             key = normalize(ref)
             if key in self._entries:
                 continue
             other = named_by.setdefault(key, ref)
-            if self._lookup.setdefault(key, image) != image:
+            if self._lookup.setdefault(key, value) != value:
                 raise ValueError(
-                    f"image map entries {other!r} and {ref!r} are both {key} but map "
-                    f"to different images; add an entry for {key!r} to choose one"
+                    f"{self.KIND} entries {other!r} and {ref!r} are both {key} but "
+                    f"map to different {self.VALUES}; add an entry for {key!r} to "
+                    "choose one"
                 )
 
+    def _check_entry(self, ref: Any, value: Any) -> None:
+        """Raise ``ValueError`` when ``ref`` -> ``value`` is not a valid entry."""
+        raise NotImplementedError
+
     @classmethod
-    def from_file(cls, path: str) -> "ImageMap":
-        """Load a JSON object of reference -> reference."""
-        data = json.loads(Path(path).read_text(), object_pairs_hook=_unique_keys)
+    def from_json(cls: Type[_MapT], text: str, path: Optional[str] = None) -> _MapT:
+        """Parse a JSON object of reference -> value; ``path`` is where it came from."""
+        data = json.loads(text, object_pairs_hook=_unique_keys)
         if not isinstance(data, dict):
-            raise ValueError("an image map must be a JSON object")
+            raise ValueError(cls.NOT_AN_OBJECT)
         return cls(data, path=path)
 
+    @classmethod
+    def from_file(cls: Type[_MapT], path: str) -> _MapT:
+        """Load a JSON object of reference -> value from ``path``."""
+        return cls.from_json(Path(path).read_text(), path=path)
+
     def resolve(self, ref: str) -> Optional[str]:
-        """The image to run for ``ref``, or ``None`` if the map does not have it."""
+        """The value for ``ref``, or ``None`` if the map does not have it."""
         return self._lookup.get(ref) or self._lookup.get(normalize(ref))
 
-    def require(self, ref: Any, job_name: str) -> str:
-        """The image to run ``job_name`` with in place of ``ref``. Raises
-        ``WorkflowError`` when ``ref`` is not a reference or not in the map."""
-        if not _is_reference(ref):
+    def require(self, image: Any, job_name: str) -> str:
+        """The value for ``job_name``'s ``image``. Raises ``WorkflowError`` when
+        ``image`` is not a reference or not in the map."""
+        if not _is_reference(image):
             raise WorkflowError(
-                f"{job_name}: container image {ref!r} is not an image reference"
+                f"{job_name}: container image {image!r} is not an image reference"
             )
-        image = self.resolve(ref)
-        if image is None:
+        value = self.resolve(image)
+        if value is None:
             where = f" {self.path}" if self.path else ""
             raise WorkflowError(
-                f"{job_name}: container image {ref!r} is not in the container image "
-                f"map{where}; add it to the map, or map it to itself to run it "
-                "unchanged"
+                self.MISSING.format(job_name=job_name, image=image, where=where)
             )
-        return image
+        return value
 
     def __len__(self) -> int:
         """The number of entries in the map (not counting normalized spellings)."""
         return len(self._entries)
+
+
+class ImageMap(_ImageKeyedMap):
+    """Image references to the images to run in their place."""
+
+    KIND = "image map"
+    VALUES = "images"
+    NOT_AN_OBJECT = "an image map must be a JSON object"
+    MISSING = (
+        "{job_name}: container image {image!r} is not in the container image "
+        "map{where}; add it to the map, or map it to itself to run it unchanged"
+    )
+
+    def _check_entry(self, ref: Any, value: Any) -> None:
+        if not _is_reference(ref) or not _is_reference(value):
+            raise ValueError(
+                f"image map entry {ref!r}: {value!r} is not a pair of references"
+            )
