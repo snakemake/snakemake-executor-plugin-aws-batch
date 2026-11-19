@@ -20,6 +20,7 @@ from snakemake_executor_plugin_aws_batch.batch_job_builder import (
 )
 from snakemake_executor_plugin_aws_batch.constant import FATAL_BATCH_STATUSES
 from snakemake_executor_plugin_aws_batch.image_map import ImageMap
+from snakemake_executor_plugin_aws_batch.rule_queues import RuleQueues
 from snakemake_interface_executor_plugins.executors.base import SubmittedJobInfo
 from snakemake_interface_executor_plugins.executors.remote import RemoteExecutor
 from snakemake_interface_executor_plugins.settings import (
@@ -200,6 +201,24 @@ class ExecutorSettings(ExecutorSettingsBase):
             "required": False,
         },
     )
+    rule_queues: Optional[str] = field(
+        default=None,
+        metadata={
+            "help": (
+                "A JSON object mapping rule names to the AWS Batch job queues (name or "
+                "ARN) their jobs run on, or the path of a file holding it (a value not "
+                "starting with '{' is a path; in a profile, give a path or a quoted "
+                "JSON string, as a YAML mapping is dropped). A rule in "
+                "the map runs on its queue even if it sets the batch_queue resource; "
+                "other rules use batch_queue, else --aws-batch-job-queue. The rules of "
+                "a group job must all map to the same queue, or none be in the map. "
+                "Unlike --set-resources on the command line, it leaves the workflow "
+                "profile's set-resources in place."
+            ),
+            "env_var": True,
+            "required": False,
+        },
+    )
 
     def __post_init__(self):
         # Fail at startup, not at the first submit, on an invalid value (a
@@ -248,6 +267,8 @@ common_settings = CommonSettings(
 class Executor(RemoteExecutor):
     # Set from the container_image_map setting in __post_init__; None = no map.
     image_map: Optional[ImageMap] = None
+    # Set from the rule_queues setting in __post_init__; None = no map.
+    rule_queues: Optional[RuleQueues] = None
 
     def __post_init__(self):
         # snakemake/snakemake:latest container image
@@ -278,14 +299,30 @@ class Executor(RemoteExecutor):
                 f"({len(self.image_map)} entries)"
             )
 
+        rule_queues = self.settings.rule_queues
+        if rule_queues:
+            try:
+                self.rule_queues = RuleQueues.from_setting(rule_queues)
+            except (OSError, ValueError) as e:
+                where = "" if RuleQueues.is_inline(rule_queues) else f" {rule_queues}"
+                raise WorkflowError(
+                    f"Failed to read the rule queue map{where} "
+                    f"(--aws-batch-rule-queues): {e}"
+                ) from e
+            count = len(self.rule_queues)
+            self.logger.info(
+                f"Rules are sent to their queues through the rule queue map "
+                f"({count} {'rule' if count == 1 else 'rules'})"
+            )
+
         try:
             self.batch_client = BatchClient(region_name=self.settings.region)
         except Exception as e:
             raise WorkflowError(f"Failed to initialize AWS Batch client: {e}") from e
 
         # Per-queue health-check results, keyed by queue ARN, so each effective
-        # queue (the global one or a per-rule ``batch_queue`` override) is
-        # described at most once across the whole run. Populated lazily by
+        # queue (the global one, a rule queue map entry or a per-rule ``batch_queue``
+        # override) is described at most once across the whole run. Populated lazily by
         # _validate_queue at submission time.
         self._queue_validation_cache: Dict[str, Optional[List[str]]] = {}
 
@@ -309,6 +346,9 @@ class Executor(RemoteExecutor):
 
         try:
             container_image = self._container_image(job)
+            rule_queue = (
+                self.rule_queues.queue_of(job) if self.rule_queues is not None else None
+            )
         except WorkflowError as e:
             # Fail this job like any other failed job: jobs already running finish,
             # and --keep-going and restarts apply.
@@ -323,11 +363,12 @@ class Executor(RemoteExecutor):
                 settings=self.settings,
                 job_command=self.format_job_exec(job),
                 batch_client=self.batch_client,
+                rule_queue=rule_queue,
             )
-            # Validate the queue this job actually targets — which may be a
-            # per-rule ``batch_queue`` override, not the global one — before
-            # submitting, so a definitively broken queue fails fast instead of
-            # leaving the job stuck RUNNABLE. Cached per queue (see
+            # Validate the queue this job actually targets — which may be a rule
+            # queue map entry or a per-rule ``batch_queue`` override, not the
+            # global one — before submitting, so a definitively broken queue fails
+            # fast instead of leaving the job stuck RUNNABLE. Cached per queue (see
             # _validate_queue), so this costs one describe per distinct queue.
             # Skipped for pre-existing job definitions: those deliberately avoid
             # Describe* calls for a smaller IAM surface (same reason the builder
@@ -516,10 +557,10 @@ class Executor(RemoteExecutor):
         per-rule ``aws_batch_job_definition`` resource not visible here.
 
         Job-queue and compute-environment health is intentionally *not* checked
-        here: which queue a job runs on can depend on a per-rule ``batch_queue``
-        resource that is not known until each job is built, and validating the
-        global queue at startup would wrongly reject a workflow that never
-        submits to it. That check happens per effective queue in
+        here: which queue a job runs on can depend on the rule queue map or a
+        per-rule ``batch_queue`` resource, not known until each job is built, and
+        validating the global queue at startup would wrongly reject a workflow
+        that never submits to it. That check happens per effective queue in
         :meth:`_validate_queue` at submission time instead.
         """
         job_definition = getattr(self.settings, "job_definition", None)
@@ -641,11 +682,11 @@ class Executor(RemoteExecutor):
         """Fail fast on a definitively misconfigured *effective* job queue.
 
         Called at submission time with the queue a job actually targets (the
-        global queue or a per-rule ``batch_queue`` override). Each distinct queue
-        is described at most once — the result is cached on
-        ``self._queue_validation_cache`` — so a workflow that fans jobs across
-        several queues validates every queue it uses without re-describing any of
-        them, and never touches a queue it does not use.
+        global queue, a rule queue map entry or a per-rule ``batch_queue``
+        override). Each distinct queue is described at most once — the result is
+        cached on ``self._queue_validation_cache`` — so a workflow that fans jobs
+        across several queues validates every queue it uses without re-describing
+        any of them, and never touches a queue it does not use.
 
         Raises :class:`WorkflowError` only for a confirmed-bad queue (disabled or
         invalid queue, no usable compute environment, ``maxvCpus=0``). Uncertainty
@@ -693,8 +734,9 @@ class Executor(RemoteExecutor):
         one healthy environment is enough for jobs to run.
 
         ``queue_arn`` names the queue to check; it defaults to the configured
-        global ``--aws-batch-job-queue`` but callers pass a per-rule
-        ``batch_queue`` override to validate the queue a job actually targets.
+        global ``--aws-batch-job-queue`` but callers pass a rule queue map entry or
+        a per-rule ``batch_queue`` override to validate the queue a job actually
+        targets.
         """
         if queue_arn is None:
             queue_arn = getattr(self.settings, "job_queue", None)
