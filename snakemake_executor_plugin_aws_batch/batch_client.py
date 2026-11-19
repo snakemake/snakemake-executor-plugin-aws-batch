@@ -13,6 +13,10 @@ class BatchClient:
         self.service_name = BATCH_SERVICE_NAME
         self.region_name = region_name
         self.client = self.initialize_batch_client()
+        # Without an explicit region, boto3 resolves one (environment, profile);
+        # record the region the client actually uses, for error messages.
+        if not self.region_name:
+            self.region_name = self.client.meta.region_name
 
     def initialize_batch_client(self):
         """
@@ -81,6 +85,19 @@ class BatchClient:
         :return: The response from the describe_job_queues method.
         """
         return self.client.describe_job_queues(**kwargs)
+
+    def describe_job_definitions(self, **kwargs) -> list:
+        """
+        Describe job definitions in AWS Batch, reading every page of the result.
+
+        :param kwargs: The keyword arguments to pass to describe_job_definitions.
+        :return: The job definitions from all pages of the response.
+        """
+        paginator = self.client.get_paginator("describe_job_definitions")
+        definitions: list = []
+        for page in paginator.paginate(**kwargs):
+            definitions.extend(page.get("jobDefinitions", []))
+        return definitions
 
     def describe_compute_environments(self, **kwargs):
         """

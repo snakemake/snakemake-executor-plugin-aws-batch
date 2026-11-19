@@ -62,8 +62,9 @@ shutdown.
 ## Add-on: default (dynamic) job-definition path
 
 These permissions are used unless you point the plugin at a pre-existing job
-definition (`--aws-batch-job-definition` or the per-rule
-`aws_batch_job_definition` resource). On the default path the plugin inspects
+definition (`--aws-batch-job-definition`, the per-rule
+`aws_batch_job_definition` resource, or a
+[job definition map](#job-definition-map)). On the default path the plugin inspects
 the queue, registers a job definition per job, and deregisters it afterwards; a
 pre-existing definition is submitted against directly with `containerOverrides`
 and needs none of these.
@@ -108,6 +109,11 @@ and needs none of these.
   executor never passes it, so `iam:PassRole` can be omitted. If a `SubmitJob`
   is ever denied citing `iam:PassRole`, grant it scoped to the definition's role
   ARN.
+
+With a [job definition map](#job-definition-map), the plugin needs none of this
+add-on (the tags add-on still applies when tags are set), only
+`batch:DescribeJobDefinitions` if a rule sets the `shared_memory_size_mb`
+resource (to check it against the definition).
 
 ## Add-on: tags (`--aws-batch-tags` or `SNAKEMAKE_AWS_BATCH_JOB_TAGS`)
 
@@ -187,12 +193,104 @@ in it fails without being submitted, like any other failed job (jobs already run
 finish, and `--keep-going` and `--retries` apply), so no job pulls an image the
 deployment has not copied. To let an image through unchanged, map it to itself.
 
+The setting takes only the path of a file, not inline JSON (unlike the
+[job definition map](#job-definition-map)), in a Snakemake profile as elsewhere.
+
 A map that names an image twice, or maps two spellings of one image to different images
 without an entry for the normalized spelling, is refused at startup.
 
 The map cannot check the image of a [pre-existing job definition](#pre-existing-job-definitions),
 so it cannot be combined with `--aws-batch-job-definition` (refused at startup) or the
-per-rule `aws_batch_job_definition` resource (that job fails).
+per-rule `aws_batch_job_definition` resource (that job fails). It can be combined with a
+[job definition map](#job-definition-map), which then looks up the mapped image.
+
+# Job Definition Map
+
+A deployment can register one AWS Batch job definition per image ahead of time, so the
+principal that runs Snakemake never registers job definitions itself and needs no
+`batch:RegisterJobDefinition` or `iam:PassRole`. Pass a JSON object mapping image
+references to those definitions (a name, a `name:revision` pair, or a job definition ARN
+with a revision), inline or as the path of a file (a value whose first non-blank
+character is not `{` is read as a path). Only this map accepts inline JSON; the container
+image map takes a file path only:
+
+```json
+{
+  "quay.io/biocontainers/samtools:1.21--h50ea8bc_0": "samtools-1-21:3",
+  "my-custom-image:tag": "arn:aws:batch:us-east-1:123456789012:job-definition/custom:1"
+}
+```
+
+```console
+snakemake --executor aws-batch --aws-batch-job-definition-map definitions.json ...
+# or: SNAKEMAKE_AWS_BATCH_JOB_DEFINITION_MAP=definitions.json
+```
+
+Inline JSON is for the command-line option and the environment variable. In a Snakemake
+profile, give the path of a file:
+
+```yaml
+aws-batch-job-definition-map: definitions.json
+```
+
+Snakemake's profile parser drops an unquoted mapping without a message (the run goes
+ahead with no map), and on Python before 3.14 a quoted inline value can make Snakemake
+fail to load the profile (`ENAMETOOLONG`, from its check of whether the value is a path).
+
+A definition that is not a name, a `name:revision` pair or a job definition ARN with a
+revision (names are letters, digits, hyphens and underscores, up to 128 characters, with
+no surrounding spaces; a revision is a positive integer with no leading zeros) is refused
+at startup. An ARN without a revision is refused because the plugin could only look it up
+by name in its own account and region, which need not be the ARN's; give the ARN's
+revision, or the bare name for its latest revision.
+
+Each job's image is resolved as without the map: the rule's `aws_batch_container_image`
+or the global `--container-image`, then its entry in the
+[container image map](#container-image-map) when one is set. That image is looked up in
+the job definition map, as written and then normalized (as in the container image map),
+and the job is submitted against the definition it names, like a
+[pre-existing job definition](#pre-existing-job-definitions): the command, environment
+variables and vcpu/mem/gpu travel in `containerOverrides`, and the plugin never registers
+or deregisters a job definition. The map is strict: a job whose image is not in it fails
+without being submitted. Each definition must run the image it is mapped from; the plugin
+cannot override a definition's image, so it relies on whoever registered them.
+
+Because the command and environment variables travel in `containerOverrides` rather than
+in a registered definition, a job whose overrides are too large is refused by
+`SubmitJob`. AWS does not document this limit for Batch; ECS documents 8192 characters
+for a task's overrides, JSON formatting included, and Batch has been reported to refuse
+larger `containerOverrides` with the same number. A large group job (many jobs' commands
+in one) or many environment variables can reach it. The plugin does not check the size
+before submitting; when `SubmitJob` refuses the overrides, the job fails with the size of
+the overrides sent, so run smaller groups or pass fewer environment variables. The same
+applies to any [pre-existing job definition](#pre-existing-job-definitions).
+
+The job role, log configuration and shared memory size come from the definitions. So
+`--aws-batch-job-role`, `--aws-batch-log-group` and `--aws-batch-job-definition` are
+refused at startup with the map. A rule's `shared_memory_size_mb` resource is accepted
+when it is at most the definition's `linuxParameters.sharedMemorySize` (the job then runs
+with the definition's size). It fails the job when it is larger, when an EC2 definition
+sets no `sharedMemorySize`, when the definition is not ACTIVE, or when it is not a
+container definition (one with ECS, multi-node or EKS properties instead of
+`containerProperties`, to which the check does not apply). On a Fargate definition (one
+whose `platformCapabilities` include `FARGATE`), which cannot set `/dev/shm`, the
+resource is ignored and a warning is logged. A value that is not a positive integer
+stops the run (0 or empty counts as unset), as without the map.
+
+The check needs `batch:DescribeJobDefinitions`. A definition is described at most once
+per run after a successful describe; a failed describe is retried by the next job. A bare
+name is checked against its latest ACTIVE revision when a job first asks for shared
+memory on it, and every job that asks for shared memory on it is then submitted to that
+revision (`name:revision`), so a revision registered during the run is neither checked nor
+used by those jobs. A job that sets no shared memory is submitted to the bare name, which
+`SubmitJob` resolves to the latest ACTIVE revision.
+
+With a job definition map, the map decides every job's definition:
+`--aws-batch-job-definition` is refused at startup, and a rule's `aws_batch_job_definition`
+resource fails that job, because the map is there so that the image, not the workflow,
+picks the definition.
+Without a map, a rule's `aws_batch_job_definition` resource comes first, then
+`--aws-batch-job-definition`, and otherwise the plugin registers a definition for the job.
 
 # Example
 
@@ -380,7 +478,11 @@ rule align:
 
 This sets `linuxParameters.sharedMemorySize` on the job definition. It only
 applies on EC2 queues — Fargate does not honor
-`linuxParameters.sharedMemorySize`, so the resource is ignored there.
+`linuxParameters.sharedMemorySize`, so the resource is ignored there. With a
+[job definition map](#job-definition-map) the plugin registers no definition, so
+the resource must instead be at most the mapped definition's size when that
+definition is for EC2 (one without a `sharedMemorySize` refuses it); on a Fargate
+definition it is ignored with a warning.
 
 # Task Logs
 
@@ -478,13 +580,17 @@ definition:
   is rejected at **startup** (preflight); combined with a per-rule
   `aws_batch_job_definition` resource it is rejected when that job is submitted.
 - The per-rule `shared_memory_size_mb` resource: `linuxParameters.sharedMemorySize`
-  is a definition-level field (rejected at job submission).
+  is a definition-level field (rejected at job submission). A
+  [job definition map](#job-definition-map) accepts it up to the definition's size.
 - `--aws-batch-log-group` (`log_group`): the log configuration is a
   definition-level field (rejected at job submission).
 
-The `--aws-batch-container-image` (`container_image`) setting and the per-rule
-`aws_batch_container_image` resource are both silently ignored in this mode — the
-container image is taken from the pre-existing definition.
+With `--aws-batch-job-definition` or the per-rule `aws_batch_job_definition`
+resource, the `--aws-batch-container-image` (`container_image`) setting and the
+per-rule `aws_batch_container_image` resource are both silently ignored — the
+container image is taken from the pre-existing definition. A
+[job definition map](#job-definition-map) differs: it uses the image to choose the
+definition.
 For the same reason a [container image map](#container-image-map) cannot be used with a
 pre-existing definition.
 
@@ -496,6 +602,12 @@ the scheduling priority (`--aws-batch-scheduling-priority` / the per-rule
 travel as `SubmitJob`'s top-level `timeout`, `schedulingPriorityOverride` and
 `retryStrategy` fields, so they apply to pre-existing definitions just as they
 do to dynamically registered ones.
+
+The command and environment variables travel in `containerOverrides`, whose size
+AWS caps (see the [job definition map](#job-definition-map) for what is known of
+the limit): a large group job or many environment variables can make `SubmitJob`
+refuse a job that a registered definition would have run. The job then fails
+with the size of the overrides it sent.
 
 # Preflight Validation
 
@@ -524,11 +636,11 @@ is checked once and the result cached, so a workflow that fans jobs across
 several queues validates every queue it uses without re-describing any of them.
 
 Jobs that submit against a **pre-existing job definition**
-(`--aws-batch-job-definition` or the per-rule `aws_batch_job_definition`
-resource) skip this queue check: like the platform lookup, it is deliberately
-omitted so those jobs keep the smaller IAM surface that static definitions are
-meant to provide (no `batch:DescribeJobQueues` /
-`batch:DescribeComputeEnvironments` required).
+(`--aws-batch-job-definition`, the per-rule `aws_batch_job_definition` resource,
+or a [job definition map](#job-definition-map)) skip this queue check: like the
+platform lookup, it is deliberately omitted so those jobs keep the smaller IAM
+surface that static definitions are meant to provide (no
+`batch:DescribeJobQueues` / `batch:DescribeComputeEnvironments` required).
 
 All of these checks are deliberately conservative about *uncertainty*: a
 transient API error, a queue mid-update (`status` `CREATING`/`UPDATING`), or a missing
@@ -539,6 +651,14 @@ executor already needs for platform detection (so a run missing those is not
 blocked by validation, but will still fail later when the job definition is
 built), plus the optional `iam:GetRole` for the job-role check and
 `logs:DescribeLogGroups` for the log-group check.
+
+The one exception is the [job definition map](#job-definition-map)'s check of a
+rule's `shared_memory_size_mb` against its definition: when
+`batch:DescribeJobDefinitions` fails, the job fails. The plugin cannot set the
+shared memory of a pre-registered definition, so skipping the check would run
+the job with an unknown `/dev/shm`, which tools that need more than they get
+fail on late and confusingly; failing the job (which `--keep-going` and
+`--retries` apply to, and which the next job retries) says what is missing.
 
 When tags are configured (via `--aws-batch-tags` or the
 `SNAKEMAKE_AWS_BATCH_JOB_TAGS` environment variable), the executor additionally
