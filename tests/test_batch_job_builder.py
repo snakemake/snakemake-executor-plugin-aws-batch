@@ -16,6 +16,7 @@ from snakemake.common.tbdstring import TBDString
 from snakemake_interface_common.exceptions import WorkflowError
 
 from snakemake_executor_plugin_aws_batch.batch_job_builder import (
+    PRIVILEGED_WITH_JOB_DEFINITION_ERROR,
     SNAKEMAKE_AWS_BATCH_JOB_TAGS_ENV_VAR,
     BatchJobBuilder,
     _sanitize_job_name,
@@ -44,6 +45,7 @@ def _make_builder(tags=None, name="test_rule") -> BatchJobBuilder:
     """
     settings = SimpleNamespace(
         job_queue="test-queue",
+        privileged=False,
         job_role="arn:aws:iam::123456789:role/test-role",
         tags=tags,
         task_timeout=300,
@@ -319,6 +321,7 @@ class TestGetPlatformFromQueue:
     def _make_settings(self):
         return SimpleNamespace(
             job_queue="test-queue",
+            privileged=False,
             job_role="arn:aws:iam::123456789:role/test-role",
             tags=None,
             task_timeout=300,
@@ -542,6 +545,7 @@ class TestErrorMessagesUseResolvedQueue:
     def _make_settings(self):
         return SimpleNamespace(
             job_queue="default-queue",
+            privileged=False,
             job_role="arn:aws:iam::123456789:role/test-role",
             tags=None,
             task_timeout=300,
@@ -674,6 +678,119 @@ class TestLogGroup:
 
 
 # ---------------------------------------------------------------------------
+# Tests for build_job_definition — privileged
+# ---------------------------------------------------------------------------
+
+
+def _privileged_builder(resources: dict | None = None, **settings) -> BatchJobBuilder:
+    """A builder for one job with the given resources and settings."""
+    builder = _make_builder(tags=None)
+    if resources is not None:
+        builder.job.resources = {"_cores": 1, "mem_mb": 1024, **resources}
+    for key, value in settings.items():
+        setattr(builder.settings, key, value)
+    builder.batch_client.register_job_definition.return_value = _fake_job_def()
+    return builder
+
+
+def _registered_privileged(builder: BatchJobBuilder) -> bool:
+    """The privileged flag of the job definition the builder registers."""
+    builder.build_job_definition()
+    return builder.batch_client.register_job_definition.call_args.kwargs[
+        "containerProperties"
+    ]["privileged"]
+
+
+class TestPrivileged:
+    def _privileged(self, resources: dict | None = None, **settings) -> bool:
+        """The privileged flag of the job definition one job registers."""
+        return _registered_privileged(_privileged_builder(resources, **settings))
+
+    def test_the_setting_off_is_not_privileged(self):
+        assert self._privileged(privileged=False) is False
+
+    def test_the_setting_opts_in_to_privileged(self):
+        assert self._privileged(privileged=True) is True
+
+    @pytest.mark.parametrize("value", [True, 1, "true", "True", "TRUE", " true ", "1"])
+    def test_the_resource_opts_a_rule_in(self, value):
+        resources = {"aws_batch_privileged": value}
+        assert self._privileged(resources, privileged=False) is True
+
+    @pytest.mark.parametrize("value", [False, 0, "false", "FALSE", "0", " 0 "])
+    def test_the_resource_opts_a_rule_out(self, value):
+        resources = {"aws_batch_privileged": value}
+        assert self._privileged(resources, privileged=True) is False
+
+    # Snakemake rounds float resources to ints, so only ints and strings arrive.
+    @pytest.mark.parametrize("value", ["maybe", "yes", 2, -1])
+    def test_an_invalid_resource_raises(self, value):
+        builder = _privileged_builder({"aws_batch_privileged": value})
+        with pytest.raises(
+            WorkflowError, match="Invalid aws_batch_privileged .* in rule test_rule"
+        ):
+            builder.build_job_definition()
+        builder.batch_client.register_job_definition.assert_not_called()
+
+    def test_privileged_plus_job_definition_raises(self):
+        """privileged + the global pre-existing job definition must raise."""
+        builder = _make_builder_with_preexisting(job_definition="my-job-def")
+        builder.settings.privileged = True
+        with pytest.raises(
+            WorkflowError, match=f"^{re.escape(PRIVILEGED_WITH_JOB_DEFINITION_ERROR)}$"
+        ):
+            builder.submit()
+        builder.batch_client.register_job_definition.assert_not_called()
+        builder.batch_client.submit_job.assert_not_called()
+
+    def test_privileged_plus_per_rule_job_definition_submits(self):
+        """The setting does not reach a rule with its own definition, which is
+        not refused."""
+        builder = _make_builder_with_preexisting(
+            job_definition=None,
+            resources={
+                "_cores": 2,
+                "mem_mb": 2048,
+                "aws_batch_job_definition": "per-rule-def",
+            },
+        )
+        builder.settings.privileged = True
+        builder.batch_client.submit_job.return_value = {"jobId": "j"}
+        builder.submit()
+        builder.batch_client.register_job_definition.assert_not_called()
+        builder.batch_client.submit_job.assert_called_once()
+        assert (
+            builder.batch_client.submit_job.call_args.kwargs["jobDefinition"]
+            == "per-rule-def"
+        )
+
+    @pytest.mark.parametrize("job_definition", ["my-job-def", None])
+    @pytest.mark.parametrize("value", [True, False])
+    def test_the_resource_plus_pre_existing_job_definition_raises(
+        self, job_definition, value
+    ):
+        resources = {"_cores": 2, "mem_mb": 2048, "aws_batch_privileged": value}
+        if job_definition is None:
+            resources["aws_batch_job_definition"] = "per-rule-def"
+        builder = _make_builder_with_preexisting(
+            job_definition=job_definition, resources=resources
+        )
+        with pytest.raises(
+            WorkflowError, match="aws_batch_privileged resource of rule test_rule"
+        ):
+            builder.submit()
+        builder.batch_client.register_job_definition.assert_not_called()
+        builder.batch_client.submit_job.assert_not_called()
+
+    def test_privileged_off_with_job_definition_submits(self):
+        builder = _make_builder_with_preexisting(job_definition="my-job-def")
+        builder.settings.privileged = False
+        builder.batch_client.submit_job.return_value = {"jobId": "j"}
+        builder.submit()
+        builder.batch_client.submit_job.assert_called_once()
+
+
+# ---------------------------------------------------------------------------
 # Tests for build_job_definition — Fargate rejection
 # ---------------------------------------------------------------------------
 
@@ -713,6 +830,7 @@ def _make_timeout_builder(task_timeout) -> BatchJobBuilder:
     """
     settings = SimpleNamespace(
         job_queue="test-queue",
+        privileged=False,
         job_role="arn:aws:iam::123456789:role/test-role",
         tags=None,
         task_timeout=task_timeout,
@@ -808,6 +926,7 @@ def _make_builder_with_rule_timeout(
 
     settings = SimpleNamespace(
         job_queue="test-queue",
+        privileged=False,
         job_role="arn:aws:iam::123456789:role/test-role",
         tags=None,
         task_timeout=setting_timeout,
@@ -915,6 +1034,7 @@ def _make_builder_with_priority(setting_priority=None, resource_priority=None):
 
     settings = SimpleNamespace(
         job_queue="test-queue",
+        privileged=False,
         job_role="arn:aws:iam::123456789:role/test-role",
         tags=None,
         scheduling_priority=setting_priority,
@@ -1185,20 +1305,39 @@ class TestSubmitSpotAttempts:
 
 def _group_of(*member_resources: dict) -> MagicMock:
     """A group job whose members have the given resources. The group's own
-    resources are what Snakemake would give it: parallel members' ints summed."""
+    resources are what Snakemake would give it: parallel members' ints summed.
+
+    Like Snakemake (``GroupResources.basic_layered``), it refuses a group whose
+    parallel members' values for a resource differ when any of them is a string, a
+    member that does not set the resource (or whose value is not evaluated yet, a
+    ``TBDString``, which Snakemake drops first) counting as ``0``: such a group never
+    reaches the executor.
+    """
+    evaluated = [
+        {k: v for k, v in resources.items() if not isinstance(v, TBDString)}
+        for resources in member_resources
+    ]
+    for key in {key for resources in evaluated for key in resources}:
+        values = [resources.get(key, 0) for resources in evaluated]
+        if not all(isinstance(v, int) for v in values) and len(set(values)) > 1:
+            raise WorkflowError(
+                f"Resource {key} is a string but not all group jobs require the "
+                f"same value. Observed values: {set(values)}."
+            )
     group = MagicMock(spec=GroupJobExecutorInterface)
     group.name = "test_group"
     group.threads = 1
-    group.jobs = [MagicMock(resources=dict(r)) for r in member_resources]
-    group.resources = {
-        "_cores": 1,
-        "mem_mb": 1024,
-        "aws_batch_spot_attempts": sum(
-            r.get("aws_batch_spot_attempts", 0)
-            for r in member_resources
-            if not isinstance(r.get("aws_batch_spot_attempts"), str)
-        ),
-    }
+    group.jobs = []
+    for index, resources in enumerate(member_resources):
+        member = MagicMock(resources=dict(resources))
+        member.name = f"member_{index}"
+        group.jobs.append(member)
+    summed: dict = {}
+    for resources in member_resources:
+        for key, value in resources.items():
+            if isinstance(value, int):  # bools too: True + True == 2
+                summed[key] = summed.get(key, 0) + value
+    group.resources = {"_cores": 1, "mem_mb": 1024, **summed}
     return group
 
 
@@ -1253,6 +1392,75 @@ class TestGroupSpotAttempts:
         builder.job = _group_of({"aws_batch_spot_attempts": 0}, {})
         with pytest.raises(WorkflowError, match="aws_batch_spot_attempts resource 0"):
             _run_submit_priority(builder)
+
+
+class TestGroupPrivileged:
+    """A group job runs in one container: privileged if any member is."""
+
+    @pytest.mark.parametrize(
+        "setting, members, expected",
+        [
+            # Summed, the group's own resources would give 2 (an invalid value).
+            (False, [{"aws_batch_privileged": True}] * 2, True),
+            # Summed, a member opting out would strip the member that inherits
+            # the setting.
+            (True, [{"aws_batch_privileged": False}, {}], True),
+            (False, [{"aws_batch_privileged": 1}, {}], True),
+            # A string is allowed when every member gives the same one.
+            (False, [{"aws_batch_privileged": "true"}] * 2, True),
+            (True, [{"aws_batch_privileged": False}] * 2, False),
+            (False, [{}, {}], False),
+            (True, [{}, {}], True),
+        ],
+    )
+    def test_any_member_makes_the_group_privileged(self, setting, members, expected):
+        builder = _privileged_builder(privileged=setting)
+        builder.job = _group_of(*members)
+        assert _registered_privileged(builder) is expected
+
+    @pytest.mark.parametrize("setting", [True, False])
+    def test_member_not_yet_evaluated_is_unset(self, setting):
+        builder = _privileged_builder(privileged=setting)
+        builder.job = _group_of(
+            {"aws_batch_privileged": False}, {"aws_batch_privileged": TBDString()}
+        )
+        assert _registered_privileged(builder) is setting
+
+    def test_a_string_beside_a_different_member_value_never_reaches_the_executor(
+        self,
+    ):
+        # As the docs say: Snakemake refuses the group first, so use True/False or
+        # 1/0 when members differ.
+        for members in [
+            ({"aws_batch_privileged": "true"}, {}),
+            ({"aws_batch_privileged": "true"}, {"aws_batch_privileged": False}),
+        ]:
+            with pytest.raises(WorkflowError, match="is a string but not all group"):
+                _group_of(*members)
+
+    def test_invalid_member_value_raises(self):
+        # Every member is validated (Snakemake passes a string all members share).
+        builder = _privileged_builder()
+        builder.job = _group_of(
+            {"aws_batch_privileged": "maybe"}, {"aws_batch_privileged": "maybe"}
+        )
+        with pytest.raises(
+            WorkflowError,
+            match="Invalid aws_batch_privileged resource 'maybe' in rule member_0",
+        ):
+            builder.build_job_definition()
+        builder.batch_client.register_job_definition.assert_not_called()
+
+    def test_member_resource_plus_pre_existing_job_definition_raises(self):
+        builder = _make_builder_with_preexisting(job_definition=None)
+        builder.job = _group_of({}, {"aws_batch_privileged": True})
+        builder.job.resources["aws_batch_job_definition"] = "per-rule-def"
+        with pytest.raises(
+            WorkflowError, match="aws_batch_privileged resource of rule member_1"
+        ):
+            builder.submit()
+        builder.batch_client.register_job_definition.assert_not_called()
+        builder.batch_client.submit_job.assert_not_called()
 
 
 class TestSpotAttemptsSetting:
@@ -1419,6 +1627,7 @@ def _make_builder_with_preexisting(
         resources = {"_cores": 2, "mem_mb": 2048}
     settings = SimpleNamespace(
         job_queue="test-queue",
+        privileged=False,
         job_role=job_role,
         job_definition=job_definition,
         tags=None,
@@ -1816,6 +2025,7 @@ class TestPreExistingJobDefinition:
         """Explicit job_definition=None must fall through to the dynamic path."""
         settings = SimpleNamespace(
             job_queue="test-queue",
+            privileged=False,
             job_role="arn:aws:iam::123456789:role/role",
             job_definition=None,
             tags=None,

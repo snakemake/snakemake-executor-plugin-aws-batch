@@ -382,6 +382,61 @@ This sets `linuxParameters.sharedMemorySize` on the job definition. It only
 applies on EC2 queues — Fargate does not honor
 `linuxParameters.sharedMemorySize`, so the resource is ignored there.
 
+# Privileged Containers
+
+Job containers are not privileged unless you ask for it. A privileged container
+has root access to the host's devices and kernel features, which weakens the
+isolation between jobs that share a host. Jobs that need it, such as those that
+run Apptainer/Singularity inside the job container
+(`--software-deployment-method apptainer`) or mount a FUSE file system, can opt
+in for the whole workflow:
+
+```bash
+snakemake --executor aws-batch --aws-batch-privileged ...
+```
+
+This sets `privileged` on each job definition the plugin registers. A rule can
+override it with the `aws_batch_privileged` resource, so only the rules that
+need it run privileged:
+
+```python
+rule apptainer_step:
+    resources:
+        aws_batch_privileged=True
+    ...
+```
+
+The resource takes precedence over `--aws-batch-privileged` in either direction.
+It may be `True`/`False`, `1`/`0`, or the same as a string (`"true"`/`"false"`/
+`"1"`/`"0"`, any case, surrounding whitespace ignored); any other value is rejected when a job of that rule is submitted, which stops
+the workflow with an error. A group job runs in one container, so it is
+privileged if any of its members is. Each member uses its own
+`aws_batch_privileged` resource, or `--aws-batch-privileged` when it leaves the
+resource unset or the resource is a function of inputs that do not exist yet
+when the group is submitted. When a group's members give the resource different
+values (one sets it and another does not, say), give them as `True`/`False` or
+`1`/`0`: Snakemake refuses a group whose members' values for a resource differ
+when any of them is a string (a member that does not set it counts as `0`), before
+the job reaches the executor.
+
+With Apptainer and without `--aws-batch-privileged`, the executor warns at
+startup, naming both ways to opt in; with `--aws-batch-job-definition` it does
+not, since that definition decides. Setting the `aws_batch_privileged` resource
+on the rules that need it does not silence the warning, because the executor
+cannot see rule resources at startup.
+
+A [pre-existing job definition](#pre-existing-job-definitions) sets `privileged`
+itself. `--aws-batch-privileged` is rejected at startup with the global
+`--aws-batch-job-definition`; a rule with its own `aws_batch_job_definition`
+resource takes `privileged` from that definition, and the setting does not reach
+it. The `aws_batch_privileged` resource on a rule that uses a pre-existing job
+definition (or on any member of such a group job) is rejected when that job is
+submitted, which stops the workflow with an error.
+
+Earlier releases made every job container privileged; a workflow that relied
+on that now needs `--aws-batch-privileged` (or the `aws_batch_privileged`
+resource).
+
 # Task Logs
 
 Unless told otherwise, AWS Batch sends every job's output to the CloudWatch
@@ -481,6 +536,14 @@ definition:
   is a definition-level field (rejected at job submission).
 - `--aws-batch-log-group` (`log_group`): the log configuration is a
   definition-level field (rejected at job submission).
+- `--aws-batch-privileged` (`privileged`) and the per-rule `aws_batch_privileged`
+  resource: whether the container is privileged is a definition-level field.
+  `--aws-batch-privileged` combined with the global `--aws-batch-job-definition`
+  is rejected at **startup** (preflight); it applies only to the definitions the
+  plugin registers, so a rule with its own `aws_batch_job_definition` resource
+  takes `privileged` from that definition (not rejected). The
+  `aws_batch_privileged` resource is rejected when a job using a pre-existing
+  definition is submitted, which stops the workflow with an error.
 
 The `--aws-batch-container-image` (`container_image`) setting and the per-rule
 `aws_batch_container_image` resource are both silently ignored in this mode — the
@@ -506,7 +569,10 @@ At startup (before submitting any job) it verifies that the job role exists
 (when `--aws-batch-job-role` is set and `iam:GetRole` is available) and that the
 log group exists (when `--aws-batch-log-group` is set and
 `logs:DescribeLogGroups` is available). A confirmed-missing role, or a malformed
-or non-existent log group, fails fast with a clear error.
+or non-existent log group, fails fast with a clear error, as does combining
+`--aws-batch-job-role` or `--aws-batch-privileged` with the global
+`--aws-batch-job-definition` (see [Pre-existing Job
+Definitions](#pre-existing-job-definitions)).
 
 Job-queue and compute-environment health is checked per **effective** queue at
 submission time, not at startup, because a rule can override the queue with the

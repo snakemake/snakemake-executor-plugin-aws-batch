@@ -1,14 +1,13 @@
 import dataclasses
 import json
 import re
-from types import SimpleNamespace
-from unittest.mock import MagicMock, patch
 
 import pytest
 from snakemake_interface_common.exceptions import WorkflowError
 
-from snakemake_executor_plugin_aws_batch import Executor, ExecutorSettings
+from snakemake_executor_plugin_aws_batch import ExecutorSettings
 from snakemake_executor_plugin_aws_batch.image_map import ImageMap, normalize
+from tests.helpers import post_init_executor
 
 DIGEST = "sha256:" + "a" * 64
 PINNED = f"123456789012.dkr.ecr.us-east-1.amazonaws.com/workers@{DIGEST}"
@@ -141,29 +140,14 @@ def test_the_setting_is_an_executor_setting():
     assert "container_image_map" in names
 
 
-def _post_init(**settings) -> Executor:
-    """Run Executor.__post_init__ with the given executor settings (AWS mocked)."""
-    executor = object.__new__(Executor)
-    executor.logger = MagicMock()
-    executor.workflow = SimpleNamespace(
-        remote_execution_settings=SimpleNamespace(container_image="global:1"),
-        executor_settings=ExecutorSettings(region="us-east-1", **settings),
-    )
-    with patch("snakemake_executor_plugin_aws_batch.BatchClient"), patch.object(
-        Executor, "_preflight_validate"
-    ):
-        executor.__post_init__()
-    return executor
-
-
 def test_no_map_is_loaded_without_the_setting():
-    assert _post_init().image_map is None
+    assert post_init_executor().image_map is None
 
 
 def test_the_map_is_loaded_from_the_setting(tmp_path):
     path = tmp_path / "images.json"
     path.write_text(json.dumps({"global:1": PINNED}))
-    executor = _post_init(container_image_map=str(path))
+    executor = post_init_executor(container_image_map=str(path))
     assert executor.image_map.resolve("global:1") == PINNED
     executor.logger.info.assert_called_once_with(
         f"Container images are resolved through {path} (1 entries)"
@@ -180,7 +164,7 @@ def test_a_map_that_cannot_be_read_fails_the_run(tmp_path, content, cause):
         path.write_text(content)
     want = f"Failed to read the container image map {path}: "
     with pytest.raises(WorkflowError, match=f"^{re.escape(want)}") as err:
-        _post_init(container_image_map=str(path))
+        post_init_executor(container_image_map=str(path))
     assert isinstance(err.value.__cause__, cause)
 
 
@@ -188,4 +172,4 @@ def test_the_map_cannot_be_combined_with_a_pre_existing_job_definition(tmp_path)
     path = tmp_path / "images.json"
     path.write_text(json.dumps({"global:1": PINNED}))
     with pytest.raises(WorkflowError, match="Cannot combine the container image map"):
-        _post_init(container_image_map=str(path), job_definition="my-def:3")
+        post_init_executor(container_image_map=str(path), job_definition="my-def:3")
