@@ -167,6 +167,7 @@ class BatchJobBuilder:
         settings,
         job_command: str,
         batch_client: BatchClient,
+        rule_queue: Optional[str] = None,
     ):
         self.logger = logger
         self.job = job
@@ -176,12 +177,27 @@ class BatchJobBuilder:
         self.job_command = job_command
         self.batch_client = batch_client
         self.created_job_defs = []
-        # Per-rule queue override via `resources.batch_queue` — lets a multi-arch
-        # workflow route each job to a queue wired to matching compute environment
-        # (e.g. ARM vs x86). Falls back to the profile-wide default queue.
-        self.job_queue = str(
-            self.job.resources.get("batch_queue", self.settings.job_queue)
+        # The queue the rule queue map (--aws-batch-rule-queues) gives the job's
+        # rule outranks its `batch_queue` resource: the map is the deployment's
+        # choice, made on the command line, which outranks the workflow's. Then the
+        # per-rule `batch_queue` resource — lets a multi-arch workflow route each job
+        # to a queue wired to matching compute environment (e.g. ARM vs x86). Falls
+        # back to the profile-wide default queue.
+        rule_batch_queue = self.job.resources.get("batch_queue")
+        self.job_queue = rule_queue or str(
+            rule_batch_queue
+            if rule_batch_queue is not None
+            else self.settings.job_queue
         )
+        if (
+            rule_queue
+            and rule_batch_queue is not None
+            and rule_queue != str(rule_batch_queue)
+        ):
+            self.logger.debug(
+                f"{self.job.name}: the rule queue map sends this job to {rule_queue}, "
+                f"not its batch_queue resource {rule_batch_queue}"
+            )
         # Platform (EC2/FARGATE) is resolved lazily on first access. Pre-existing
         # job definitions skip definition-building entirely, so they must not be
         # forced to hold batch:DescribeJobQueues / DescribeComputeEnvironments

@@ -13,11 +13,12 @@ as written, then in its normalized form (``ubuntu`` and
 spelling.
 """
 
-import json
 from pathlib import Path
-from typing import Any, Dict, List, Mapping, Optional, Tuple
+from typing import Any, Dict, Mapping, Optional
 
 from snakemake_interface_common.exceptions import WorkflowError
+
+from snakemake_executor_plugin_aws_batch.json_map import load_json_object
 
 DOCKER_HUB = "docker.io"
 DOCKER_HUB_ALIASES = ("index.docker.io", "registry-1.docker.io")
@@ -58,16 +59,6 @@ def _is_reference(value: Any) -> bool:
     return isinstance(value, str) and bool(value.strip())
 
 
-def _unique_keys(pairs: List[Tuple[str, Any]]) -> Dict[str, Any]:
-    """A JSON object hook that rejects a key given twice (JSON keeps the last)."""
-    obj: Dict[str, Any] = {}
-    for key, value in pairs:
-        if key in obj:
-            raise ValueError(f"image {key!r} is in the map twice")
-        obj[key] = value
-    return obj
-
-
 class ImageMap:
     """Image references to the images to run in their place."""
 
@@ -100,10 +91,8 @@ class ImageMap:
     @classmethod
     def from_file(cls, path: str) -> "ImageMap":
         """Load a JSON object of reference -> reference."""
-        data = json.loads(Path(path).read_text(), object_pairs_hook=_unique_keys)
-        if not isinstance(data, dict):
-            raise ValueError("an image map must be a JSON object")
-        return cls(data, path=path)
+        text = Path(path).read_text(encoding="utf-8")
+        return cls(load_json_object(text, "image", "an image map"), path=path)
 
     def resolve(self, ref: str) -> Optional[str]:
         """The image to run for ``ref``, or ``None`` if the map does not have it."""
