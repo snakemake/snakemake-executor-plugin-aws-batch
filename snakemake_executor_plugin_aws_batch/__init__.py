@@ -7,7 +7,7 @@ import re
 import uuid
 from dataclasses import dataclass, field
 from pprint import pformat
-from typing import Dict, List, AsyncGenerator, Optional
+from typing import AsyncGenerator, Optional
 
 import boto3
 from botocore.exceptions import ClientError
@@ -201,7 +201,7 @@ class ExecutorSettings(ExecutorSettingsBase):
         },
     )
 
-    def __post_init__(self):
+    def __post_init__(self) -> None:
         # Fail at startup, not at the first submit, on an invalid value (a
         # per-rule aws_batch_spot_attempts resource is checked at submit).
         if self.spot_attempts is not None:
@@ -249,13 +249,13 @@ class Executor(RemoteExecutor):
     # Set from the container_image_map setting in __post_init__; None = no map.
     image_map: Optional[ImageMap] = None
 
-    def __post_init__(self):
+    def __post_init__(self) -> None:
         # snakemake/snakemake:latest container image
         self.container_image = self.workflow.remote_execution_settings.container_image
 
         self.next_seconds_between_status_checks = 5
 
-        self.settings = self.workflow.executor_settings
+        self.settings: ExecutorSettings = self.workflow.executor_settings
         self.logger.debug(f"ExecutorSettings: {pformat(self.settings, indent=2)}")
 
         map_path = self.settings.container_image_map
@@ -287,7 +287,7 @@ class Executor(RemoteExecutor):
         # queue (the global one or a per-rule ``batch_queue`` override) is
         # described at most once across the whole run. Populated lazily by
         # _validate_queue at submission time.
-        self._queue_validation_cache: Dict[str, Optional[List[str]]] = {}
+        self._queue_validation_cache: dict[str, Optional[list[str]]] = {}
 
         # Fail fast on a definitively misconfigured job role before submitting any
         # jobs (degrades to a no-op if state is uncertain). Queue/compute-env
@@ -296,7 +296,7 @@ class Executor(RemoteExecutor):
         # never blocks a workflow that only submits to healthy per-rule queues.
         self._preflight_validate()
 
-    def run_job(self, job: JobExecutorInterface):
+    def run_job(self, job: JobExecutorInterface) -> None:
         # Implement here how to run a job.
         # You can access the job's resources, etc.
         # via the job object.
@@ -374,7 +374,7 @@ class Executor(RemoteExecutor):
         return self.image_map.require(image, job.name)
 
     async def check_active_jobs(
-        self, active_jobs: List[SubmittedJobInfo]
+        self, active_jobs: list[SubmittedJobInfo]
     ) -> AsyncGenerator[SubmittedJobInfo, None]:
         # Check the status of active jobs.
 
@@ -412,12 +412,15 @@ class Executor(RemoteExecutor):
             else:
                 yield job
 
-    def _get_job_status(self, job: SubmittedJobInfo) -> tuple[int, Optional[str]]:
+    def _get_job_status(
+        self, job: SubmittedJobInfo
+    ) -> tuple[Optional[int], Optional[str]]:
         """
         Poll for Batch job status and return exit code and message if job is complete.
 
         Returns:
-            tuple: (exit_code, failure_message)
+            tuple: (exit_code, failure_message); exit_code is None while pending
+                or when the status cannot be determined.
         """
         try:
             response = self.batch_client.describe_jobs(jobs=[job.external_jobid])
@@ -450,7 +453,7 @@ class Executor(RemoteExecutor):
             self.logger.error(f"Error getting job status: {e}")
             return None, str(e)
 
-    def _terminate_job(self, job: SubmittedJobInfo):
+    def _terminate_job(self, job: SubmittedJobInfo) -> None:
         """terminate job from submitted job info"""
         try:
             self.logger.debug(f"terminating job {job.external_jobid}")
@@ -463,7 +466,7 @@ class Executor(RemoteExecutor):
                 f"failed to terminate Batch job: {job.external_jobid} with error: {e}"
             )
 
-    def _deregister_job(self, job: SubmittedJobInfo):
+    def _deregister_job(self, job: SubmittedJobInfo) -> None:
         """deregister batch job definition"""
         try:
             # Pre-existing job definitions are not owned by this executor;
@@ -487,12 +490,12 @@ class Executor(RemoteExecutor):
                 f"{job_def_arn} with error {e}"
             )
 
-    def cleanup_job_resources(self, job: SubmittedJobInfo):
+    def cleanup_job_resources(self, job: SubmittedJobInfo) -> None:
         """Terminate and deregister job resources"""
         self._terminate_job(job)
         self._deregister_job(job)
 
-    def cancel_jobs(self, active_jobs: List[SubmittedJobInfo]):
+    def cancel_jobs(self, active_jobs: list[SubmittedJobInfo]) -> None:
         # Cancel all active jobs.
         # This method is called when Snakemake is interrupted.
         # perform additional steps on shutdown if necessary
@@ -670,7 +673,7 @@ class Executor(RemoteExecutor):
                 + ". Check the queue and its compute environment(s)."
             )
 
-    def _queue_problems(self, queue_arn: Optional[str] = None) -> Optional[List[str]]:
+    def _queue_problems(self, queue_arn: Optional[str] = None) -> Optional[list[str]]:
         """Return definitive job-queue / compute-environment misconfigurations.
 
         Returns an empty list when everything looks healthy, a non-empty list of
@@ -716,7 +719,7 @@ class Executor(RemoteExecutor):
         if not queues:
             return ["job queue not found"]
         jq = queues[0]
-        problems: List[str] = []
+        problems: list[str] = []
         if jq.get("state") != "ENABLED":
             problems.append(f"job queue is {jq.get('state')} (not ENABLED)")
         if jq.get("status") in FATAL_BATCH_STATUSES:
@@ -743,11 +746,11 @@ class Executor(RemoteExecutor):
             # attached compute environment is unusable. Collect per-CE reasons
             # but surface them only when none is usable — one healthy compute
             # environment is enough for jobs to run.
-            ce_reasons: List[str] = []
+            ce_reasons: list[str] = []
             any_usable = False
             for ce in ces:
                 name = ce.get("computeEnvironmentName", "?")
-                reasons: List[str] = []
+                reasons: list[str] = []
                 if ce.get("state") != "ENABLED":
                     reasons.append(f"compute environment {name} is {ce.get('state')}")
                 if ce.get("status") in FATAL_BATCH_STATUSES:
