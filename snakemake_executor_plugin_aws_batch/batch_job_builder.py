@@ -1,7 +1,7 @@
 import os
 import re
 import uuid
-from typing import Any, List, Optional
+from typing import TYPE_CHECKING, Any, Optional
 from botocore.exceptions import ClientError
 from snakemake_interface_common.exceptions import WorkflowError
 from snakemake_interface_executor_plugins.jobs import (
@@ -15,6 +15,10 @@ from snakemake_executor_plugin_aws_batch.constant import (
     BATCH_JOB_PLATFORM_CAPABILITIES,
     BATCH_JOB_RESOURCE_REQUIREMENT_TYPE,
 )
+
+if TYPE_CHECKING:
+    from snakemake_executor_plugin_aws_batch import ExecutorSettings
+    from snakemake_interface_executor_plugins.logging import LoggerExecutorInterface
 
 SNAKEMAKE_AWS_BATCH_JOB_TAGS_ENV_VAR = "SNAKEMAKE_AWS_BATCH_JOB_TAGS"
 
@@ -53,7 +57,7 @@ def validate_spot_attempts(attempts: Any, source: str) -> int:
     return attempts_int
 
 
-def build_job_tags(settings) -> dict:
+def build_job_tags(settings: "ExecutorSettings") -> dict[str, str]:
     """Merge the job tags from ``settings.tags`` and the env var.
 
     Merges tags from ``settings.tags`` with those from the
@@ -71,7 +75,9 @@ def build_job_tags(settings) -> dict:
     :return: merged tags dict (may be empty).
     """
     settings_tags = getattr(settings, "tags", None)
-    tags: dict = dict(settings_tags) if isinstance(settings_tags, dict) else {}
+    tags: dict[str, str] = (
+        dict(settings_tags) if isinstance(settings_tags, dict) else {}
+    )
     for key in tags:
         if not key or not key.strip():
             raise WorkflowError("Invalid tags in settings: tag key cannot be empty.")
@@ -160,14 +166,14 @@ def _sanitize_job_name(name: str, max_length: int = MAX_RULE_NAME_LENGTH) -> str
 class BatchJobBuilder:
     def __init__(
         self,
-        logger,
+        logger: "LoggerExecutorInterface",
         job: JobExecutorInterface,
-        envvars: dict,
+        envvars: dict[str, str],
         container_image: str,
-        settings,
+        settings: "ExecutorSettings",
         job_command: str,
         batch_client: BatchClient,
-    ):
+    ) -> None:
         self.logger = logger
         self.job = job
         self.envvars = envvars
@@ -175,7 +181,7 @@ class BatchJobBuilder:
         self.settings = settings
         self.job_command = job_command
         self.batch_client = batch_client
-        self.created_job_defs = []
+        self.created_job_defs: list[dict[str, Any]] = []
         # Per-rule queue override via `resources.batch_queue` — lets a multi-arch
         # workflow route each job to a queue wired to matching compute environment
         # (e.g. ARM vs x86). Falls back to the profile-wide default queue.
@@ -204,7 +210,7 @@ class BatchJobBuilder:
     def platform(self, value: str) -> None:
         self._platform = value
 
-    def _make_container_command(self, remote_command: str) -> List[str]:
+    def _make_container_command(self, remote_command: str) -> list[str]:
         """
         Return docker CMD form of the command
         """
@@ -358,7 +364,7 @@ class BatchJobBuilder:
         else:
             return self._validate_ec2_resources(vcpu_int, mem_int)
 
-    def build_job_definition(self):
+    def build_job_definition(self) -> tuple[dict[str, Any], str]:
         # Fargate requires platform-specific container properties this plugin
         # does not yet emit (executionRoleArn is mandatory; privileged mode
         # and GPU resources are unsupported). Without those changes the
@@ -410,7 +416,7 @@ class BatchJobBuilder:
         if self.envvars:
             environment = [{"name": k, "value": v} for k, v in self.envvars.items()]
 
-        container_properties = {
+        container_properties: dict[str, Any] = {
             "image": self.container_image,
             # command requires a list of strings (docker CMD format)
             "command": self._make_container_command(self.job_command),
@@ -498,7 +504,7 @@ class BatchJobBuilder:
         except Exception as e:
             raise WorkflowError(f"Failed to register job definition: {e}") from e
 
-    def _build_job_tags(self) -> dict:
+    def _build_job_tags(self) -> dict[str, str]:
         """Build the merged tags dict for this job (see :func:`build_job_tags`)."""
         return build_job_tags(self.settings)
 
@@ -609,7 +615,7 @@ class BatchJobBuilder:
             return None
         return validate_spot_attempts(attempts, attempts_source)
 
-    def _resolve_retry_strategy(self) -> Optional[dict]:
+    def _resolve_retry_strategy(self) -> Optional[dict[str, Any]]:
         """The job's ``retryStrategy``, or ``None`` when spot attempts are unset.
 
         Retries only a job whose EC2 host was terminated (a reclaimed Spot
@@ -690,7 +696,9 @@ class BatchJobBuilder:
                 "Remove --aws-batch-log-group or the pre-existing job definition."
             )
 
-    def _submit_with_preexisting_definition(self, job_definition: str) -> dict:
+    def _submit_with_preexisting_definition(
+        self, job_definition: str
+    ) -> dict[str, Any]:
         """Submit a job using a pre-existing definition via containerOverrides.
 
         Skips ``register_job_definition`` entirely.  Per-job specifics — command,
@@ -739,7 +747,7 @@ class BatchJobBuilder:
                 }
             )
 
-        container_overrides: dict = {
+        container_overrides: dict[str, Any] = {
             "command": self._make_container_command(self.job_command),
             "resourceRequirements": resource_requirements,
         }
@@ -748,7 +756,7 @@ class BatchJobBuilder:
                 {"name": k, "value": v} for k, v in self.envvars.items()
             ]
 
-        job_params: dict = {
+        job_params: dict[str, Any] = {
             "jobName": job_name,
             "jobQueue": self.job_queue,
             "jobDefinition": job_definition,
@@ -791,7 +799,7 @@ class BatchJobBuilder:
         except Exception as e:
             raise WorkflowError(f"Failed to submit job: {e}") from e
 
-    def submit(self):
+    def submit(self) -> dict[str, Any]:
         preexisting = self._resolve_preexisting_job_definition()
         if preexisting:
             return self._submit_with_preexisting_definition(preexisting)
@@ -802,7 +810,7 @@ class BatchJobBuilder:
 
         job_def, job_name = self.build_job_definition()
 
-        job_params = {
+        job_params: dict[str, Any] = {
             "jobName": job_name,
             "jobQueue": self.job_queue,
             "jobDefinition": "{}:{}".format(

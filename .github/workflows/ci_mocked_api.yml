@@ -68,6 +68,28 @@ jobs:
       - name: Check code
         run: poetry run flake8
 
+  typing:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out the code
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Install poetry
+        run: pip install poetry==2.5.2
+
+      - name: Determine dependencies
+        run: poetry lock
+
+      - name: Install dependencies
+        run: poetry install --with dev
+
+      - name: Check types
+        run: poetry run mypy
+
   testing:
     runs-on: ubuntu-latest
     strategy:
